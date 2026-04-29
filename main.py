@@ -77,7 +77,7 @@ SESSION_TYPES = {
 
 TEMP_CHANGE = {0: "up", 1: "down", 2: "no change"}
 
-TYRE_COMPOUNDS = {16: "S", 17: "M", 18: "H", 7: "I", 8: "W"}
+TYRE_COMPOUNDS = {16: "SOF", 17: "MED", 18: "HAR", 7: "INT", 8: "WET"}
 
 ERS_MODES = {0: "None", 1: "Medium", 2: "Hotlap", 3: "Overtake"}
 
@@ -327,7 +327,7 @@ def parse_car_damage(data):
 def format_signed_seconds(delta_seconds):
     if delta_seconds is None:
         return "-"
-    return f"{delta_seconds:+.3f}"
+    return f"{delta_seconds:+.2f}s"
 
 
 def lap_diff_between(other, player):
@@ -807,7 +807,7 @@ class F1OverlayApp:
             is_player = idx == self.player_car_index
             name = "------" if is_player else self._car_display_name(idx)
             tyre, _wear = get_compound_and_max_wear(idx, self.car_statuses, self.car_damages)
-            lines.append(f"{pos:<2} {name[:12]:<12} {tyre}")
+            lines.append(f"{pos:<2} {name[:12]:<12} {tyre:<3}")
         return lines
 
     def _build_standings_rows(self):
@@ -854,7 +854,7 @@ class F1OverlayApp:
             pen_text = " ".join(pen_parts)
 
             all_rows.append(
-                f"{pos:<2} {name[:10]:<10} {gap_text:>8} {tyre} {wear:>5} {fw_text:>7} {pen_text}"
+                f"{pos:<2} {name[:10]:<10} {gap_text:>9} {tyre:<3} {wear:>5} {fw_text:>9} {pen_text}"
             )
 
         if player_list_idx is None:
@@ -938,7 +938,7 @@ class F1OverlayApp:
 
         player = self.lap_summary.get(self.player_car_index)
         if not player or player.get("position", 0) <= 0:
-            return [f"{'Pit?':<5} {'-':<10} {'-':>8} {'-':>8}"], ["No lap data yet"]
+            return [f"{'Pit?':<5} {'-':<10} {'-':>9} {'-':>9}"], ["No lap data yet"]
 
         player_pos = player["position"]
         player_delta_to_leader = player["delta_to_leader"]
@@ -996,7 +996,7 @@ class F1OverlayApp:
         loss_text = f"loss{loss_marker}{pit_loss:.0f}s"
 
         top_lines = [
-            f"{'Pit?':<5} {projected_position_text:<10} {ahead_text:>8} {behind_text:>8}  {loss_text}"
+            f"{'Pit?':<5} {projected_position_text:<10} {ahead_text:>9} {behind_text:>9}  {loss_text}"
         ]
 
         # Penalties yet to be served — shown separately so the projection above
