@@ -31,3 +31,6 @@ Thumbs.db
 # PyInstaller executables
 *.exe
 *.app
+
+# Other
+CLAUDE.md
