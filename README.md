@@ -12,7 +12,7 @@ This overlay listens to UDP telemetry packets from F1 25 game and displays real-
 
 ## Installation
 
-Download an existing release containing the exe file. Or if you want to build from run/build from source:
+Download an existing release containing the exe file. Or if you want to run/build from source:
 
 1. Clone the repository
 2. Create a `settings.json` file in the root directory (see Configuration section)
