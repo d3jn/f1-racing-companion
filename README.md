@@ -20,7 +20,7 @@ Create a `settings.json` file in the project root with the following structure:
 
 ```json
 {
-    "udp_port": 20778,
+    "udp_port": 20777,
     "borderless": false,
     "always_on_top": false,
     "smart_pit_projection": false,
@@ -39,7 +39,7 @@ Create a `settings.json` file in the project root with the following structure:
 
 ### Settings Keys
 
-- **`udp_port`** (integer): The UDP port on which the overlay listens for telemetry packets. The default F1 game UDP port is `20778`.
+- **`udp_port`** (integer): The UDP port on which the overlay listens for telemetry packets. The default F1 game UDP port is `20777`.
 
 - **`borderless`** (boolean): When `true`, hides the OS title bar so the overlay looks cleaner. You can still drag the window by holding left-click anywhere on the content. Default is `false`.
 
