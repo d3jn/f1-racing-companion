@@ -60,7 +60,7 @@ All the settings are available in `settings.json` file in the project root with 
 To create a standalone executable using PyInstaller:
 
 ```bash
-pyinstaller --onefile --noconsole --icon=icon.ico main.py
+pyinstaller --onefile --noconsole --icon=assets/icon.ico main.py
 ```
 
 This will generate an executable in the `dist/` directory that can be run without requiring Python to be installed.
