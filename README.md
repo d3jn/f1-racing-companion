@@ -21,6 +21,9 @@ Create a `settings.json` file in the project root with the following structure:
 ```json
 {
     "udp_port": 20778,
+    "borderless": false,
+    "always_on_top": false,
+    "smart_pit_projection": false,
     "drivers": [
         {
             "name": "DRIVER_NAME",
@@ -37,7 +40,13 @@ Create a `settings.json` file in the project root with the following structure:
 ### Settings Keys
 
 - **`udp_port`** (integer): The UDP port on which the overlay listens for telemetry packets. The default F1 game UDP port is `20778`.
-  
+
+- **`borderless`** (boolean): When `true`, hides the OS title bar so the overlay looks cleaner. You can still drag the window by holding left-click anywhere on the content. Default is `false`.
+
+- **`always_on_top`** (boolean): When `true`, keeps the overlay window above other windows even when it loses focus. Default is `false`. Leave it off if you're compositing through SteamVR — the host handles z-ordering for you.
+
+- **`smart_pit_projection`** (boolean): When `true`, the app records your pit stop times during the race and uses those measured values to refine the pit projection on page 2. When `false`, only the hardcoded baseline values are used. Default is `false`. This setting is experimental and requires a lot of clean stops to calibrate per track before it pays off, so leave it off unless you're willing to tune it across many sessions.
+
 - **`drivers`** (array): A list of driver objects with custom names and numbers. This allows you to map custom display names to driver numbers for your league or session.
   - **`name`** (string): The display name for the driver
   - **`number`** (string): The driver number as used in the game

@@ -21,6 +21,9 @@ _pit_calibration_path = os.path.join(_base_dir, "pit_calibration.json")
 with open(_settings_path, "r") as _f:
     _settings = json.load(_f)
 UDP_PORT = _settings["udp_port"]
+BORDERLESS = bool(_settings.get("borderless", False))
+ALWAYS_ON_TOP = bool(_settings.get("always_on_top", False))
+SMART_PIT_PROJECTION = bool(_settings.get("smart_pit_projection", False))
 
 
 def _normalize_race_number(num):
@@ -45,12 +48,12 @@ PACKET_CAR_DAMAGE = 10
 NUM_CARS = 22
 
 WEATHER_TYPES = {
-    0: "☀️",
-    1: "⛅",
-    2: "☁️",
-    3: "!🌧️",
-    4: "!!🌧️",
-    5: "!!!🌧️",
+    0: "S",
+    1: "S+C",
+    2: "C",
+    3: "LR",
+    4: "MR",
+    5: "HR",
 }
 
 SESSION_TYPES = {
@@ -74,6 +77,10 @@ SESSION_TYPES = {
     17: "Race 3",
     18: "Time Trial",
 }
+
+# Quali (5-9), Sprint Shootout (10-14), Race (15-17) — others show placeholder.
+ACTIVE_SESSION_TYPES = {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
+RACE_SESSION_TYPES = {15, 16, 17}
 
 TEMP_CHANGE = {0: "up", 1: "down", 2: "no change"}
 
@@ -222,12 +229,13 @@ def parse_event_button_status(data):
 def parse_session_packet(data):
     pre = struct.unpack_from(PRE_MARSHAL_FMT, data, HEADER_SIZE)
     track_length_m = pre[4]
+    session_type = pre[5]
     track_id = pre[6]
     formula = pre[7]
 
     offset = HEADER_SIZE + PRE_MARSHAL_SIZE + MARSHAL_ZONE_SIZE * 21
     if offset + POST_MARSHAL_SIZE > len(data):
-        return [], track_id, formula, 0, track_length_m
+        return [], track_id, formula, 0, track_length_m, session_type
 
     post = struct.unpack_from(POST_MARSHAL_FMT, data, offset)
     safety_car_status = post[0]
@@ -251,7 +259,7 @@ def parse_session_packet(data):
         })
         offset += WEATHER_SAMPLE_SIZE
 
-    return samples, track_id, formula, safety_car_status, track_length_m
+    return samples, track_id, formula, safety_car_status, track_length_m, session_type
 
 
 def parse_lap_positions(data):
@@ -328,6 +336,27 @@ def format_signed_seconds(delta_seconds):
     if delta_seconds is None:
         return "-"
     return f"{delta_seconds:+.2f}s"
+
+
+def _col(value, width, right=False):
+    s = str(value)
+    if len(s) > width:
+        s = s[:width]
+    return s.rjust(width) if right else s.ljust(width)
+
+
+PAGE_INNER_WIDTH = 53
+PAGE_INNER_HEIGHT = 23
+_BORDER_TOP = "┌" + "─" * PAGE_INNER_WIDTH + "┐"
+_BORDER_BOTTOM = "└" + "─" * PAGE_INNER_WIDTH + "┘"
+
+
+def _compose_page(lines):
+    body = [_col(line, PAGE_INNER_WIDTH) for line in lines[:PAGE_INNER_HEIGHT]]
+    while len(body) < PAGE_INNER_HEIGHT:
+        body.append(" " * PAGE_INNER_WIDTH)
+    middle = [f"│{line}│" for line in body]
+    return "\n".join([_BORDER_TOP, *middle, _BORDER_BOTTOM])
 
 
 def lap_diff_between(other, player):
@@ -463,9 +492,10 @@ class PitCalibrator:
       - the resulting delta change is within sanity bounds.
     """
 
-    def __init__(self, store_path):
+    def __init__(self, store_path, enabled=True):
         self._path = store_path
-        self._data = self._load()
+        self._enabled = enabled
+        self._data = self._load() if enabled else {}
         self._state = "out"          # "out" | "in_pit" | "out_lap"
         self._pre = None
         self._exit_lap = None
@@ -487,6 +517,8 @@ class PitCalibrator:
             pass
 
     def observe(self, player_lap_info, fw_damage_max, track_id, formula, sc_status):
+        if not self._enabled:
+            return
         if not player_lap_info:
             return
         pit_status = player_lap_info.get("pit_status", 0)
@@ -576,6 +608,10 @@ class F1OverlayApp:
         self.root = tk.Tk()
         self.root.title("F125 Race Engineer Overlay")
         self.root.configure(bg="black")
+        if BORDERLESS:
+            self.root.overrideredirect(True)
+        if ALWAYS_ON_TOP:
+            self.root.wm_attributes("-topmost", True)
 
         self.lap_summary = {}
         self.car_statuses = {}
@@ -587,6 +623,7 @@ class F1OverlayApp:
         self.track_length_m = 0
         self.formula = 0
         self.safety_car_status = 0
+        self.session_type = 0
         self.player_car_index = 0
         self.active_page_index = 1
         self._prev_buttons_state = 0
@@ -595,7 +632,7 @@ class F1OverlayApp:
         self._last_stale_state = None
 
         self._wear_tracker = WearTracker()
-        self._pit_calibrator = PitCalibrator(_pit_calibration_path)
+        self._pit_calibrator = PitCalibrator(_pit_calibration_path, enabled=SMART_PIT_PROJECTION)
 
         # Cross-thread wake-up signal. The actual data lives in instance dicts;
         # the queue is just a coalesced "something changed, please render" flag.
@@ -616,19 +653,23 @@ class F1OverlayApp:
     def _build_ui(self):
         font = ("Consolas", 9)
 
-        self.cars_var = tk.StringVar()
-        self.cars_label = tk.Label(
-            self.root, textvariable=self.cars_var, font=font,
+        self.page_var = tk.StringVar()
+        self.page_label = tk.Label(
+            self.root, textvariable=self.page_var, font=font,
             fg="white", bg="black", justify="left", anchor="nw",
         )
-        self.cars_label.pack(fill="x", padx=4, pady=0)
+        self.page_label.pack(padx=4, pady=2)
+        self.page_label.bind("<Button-1>", self._start_move)
+        self.page_label.bind("<B1-Motion>", self._do_move)
 
-        self.weather_var = tk.StringVar()
-        self.weather_label = tk.Label(
-            self.root, textvariable=self.weather_var, font=font,
-            fg="white", bg="black", justify="left", anchor="nw",
-        )
-        self.weather_label.pack(fill="x", padx=4, pady=0)
+    def _start_move(self, event):
+        self._drag_offset_x = event.x_root - self.root.winfo_x()
+        self._drag_offset_y = event.y_root - self.root.winfo_y()
+
+    def _do_move(self, event):
+        new_x = event.x_root - self._drag_offset_x
+        new_y = event.y_root - self._drag_offset_y
+        self.root.geometry(f"+{new_x}+{new_y}")
 
     def _udp_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -658,7 +699,8 @@ class F1OverlayApp:
                     continue
                 elif pid == PACKET_SESSION_DATA:
                     (self.weather_samples, self.track_id, self.formula,
-                     self.safety_car_status, self.track_length_m) = parse_session_packet(data)
+                     self.safety_car_status, self.track_length_m,
+                     self.session_type) = parse_session_packet(data)
                 else:
                     continue
             except struct.error:
@@ -760,6 +802,8 @@ class F1OverlayApp:
         return bool(player) and player.get("result_status", 0) in RETIRED_STATUS_SET
 
     def _is_race_start(self):
+        if self.session_type not in RACE_SESSION_TYPES:
+            return False
         player = self.lap_summary.get(self.player_car_index)
         if not player:
             return False
@@ -785,8 +829,8 @@ class F1OverlayApp:
         for i, s in enumerate(self.weather_samples, 1):
             weather = WEATHER_TYPES.get(s["weather"], f"?({s['weather']})")
             lines.append(
-                f"{i:<3} {s['time_offset']:>3} min  "
-                f"{weather}  {s['rain_pct']:>3}%"
+                f"{_col(i, 2)} {_col(s['time_offset'], 3, right=True)} min  "
+                f"{_col(weather, 3)}  {_col(s['rain_pct'], 3, right=True)}%"
             )
         if not lines:
             lines = ["No weather data yet"]
@@ -807,7 +851,7 @@ class F1OverlayApp:
             is_player = idx == self.player_car_index
             name = "------" if is_player else self._car_display_name(idx)
             tyre, _wear = get_compound_and_max_wear(idx, self.car_statuses, self.car_damages)
-            lines.append(f"{pos:<2} {name[:12]:<12} {tyre:<3}")
+            lines.append(f"{_col(pos, 2)} {_col(name, 12)} {_col(tyre, 3)}")
         return lines
 
     def _build_standings_rows(self):
@@ -854,7 +898,9 @@ class F1OverlayApp:
             pen_text = " ".join(pen_parts)
 
             all_rows.append(
-                f"{pos:<2} {name[:10]:<10} {gap_text:>9} {tyre:<3} {wear:>5} {fw_text:>9} {pen_text}"
+                f"{_col(pos, 2)} {_col(name, 10)} {_col(gap_text, 8, right=True)} "
+                f"{_col(tyre, 3)} {_col(wear, 4, right=True)} "
+                f"{_col(fw_text, 9, right=True)} {_col(pen_text, 11)}"
             )
 
         if player_list_idx is None:
@@ -880,7 +926,7 @@ class F1OverlayApp:
             else:
                 left = f"~{laps_left:.0f}L left" if laps_left is not None else "-"
                 deg_text = f"+{rate:.1f}/lap {left}"
-            lines.append(f"Tyre: {max_wear:.0f}% ({corner}) {deg_text}")
+            lines.append(f"Tyre: {max_wear:.0f}% ({corner}) {_col(deg_text, 22)}")
 
         status = self.car_statuses.get(self.player_car_index)
         if status:
@@ -904,27 +950,38 @@ class F1OverlayApp:
         if not player:
             return ["Waiting for telemetry..."], []
 
-        player_pos = player.get("position", 0)
-        ahead_idx = None
-        behind_idx = None
-        for idx, info in self.lap_summary.items():
-            if info.get("result_status", 0) not in ACTIVE_STATUS_SET:
-                continue
-            pos = info.get("position", 0)
-            if pos == player_pos - 1:
-                ahead_idx = idx
-            if pos == player_pos + 1:
-                behind_idx = idx
-
-        ahead_info = get_car_info(ahead_idx, self.car_statuses, self.car_damages) if ahead_idx is not None else None
-        behind_info = get_car_info(behind_idx, self.car_statuses, self.car_damages) if behind_idx is not None else None
-
         cars_lines = []
-        for label, info in [("⬆", ahead_info), ("⬇", behind_info)]:
-            if info:
-                cars_lines.append(f"{label}  {info['tyre']:<4} {info['wear']:<14} {info['battery']:<8} {info['ers_mode']}")
-            else:
-                cars_lines.append(f"{label}  {'-':<4} {'-':<14} {'-':<8} {'-'}")
+        if self.session_type in RACE_SESSION_TYPES:
+            player_pos = player.get("position", 0)
+            ahead_idx = None
+            behind_idx = None
+            for idx, info in self.lap_summary.items():
+                if info.get("result_status", 0) not in ACTIVE_STATUS_SET:
+                    continue
+                pos = info.get("position", 0)
+                if pos == player_pos - 1:
+                    ahead_idx = idx
+                if pos == player_pos + 1:
+                    behind_idx = idx
+
+            ahead_lap = self.lap_summary.get(ahead_idx) if ahead_idx is not None else None
+            behind_lap = self.lap_summary.get(behind_idx) if behind_idx is not None else None
+            ahead_info = get_car_info(ahead_idx, self.car_statuses, self.car_damages) if ahead_idx is not None else None
+            behind_info = get_car_info(behind_idx, self.car_statuses, self.car_damages) if behind_idx is not None else None
+
+            for other_lap, info in [(ahead_lap, ahead_info), (behind_lap, behind_info)]:
+                if info and other_lap:
+                    gap_text = gap_text_between(other_lap, player, self.track_length_m)
+                    cars_lines.append(
+                        f"{_col(gap_text, 8, right=True)} {_col(info['tyre'], 3)} "
+                        f"{_col(info['wear'], 9)} {_col(info['battery'], 4)} "
+                        f"{_col(info['ers_mode'], 8)}"
+                    )
+                else:
+                    cars_lines.append(
+                        f"{_col('-', 8, right=True)} {_col('-', 3)} {_col('-', 9)} "
+                        f"{_col('-', 4)} {_col('-', 8)}"
+                    )
 
         cars_lines.extend(self._build_player_extras(player))
 
@@ -933,12 +990,17 @@ class F1OverlayApp:
     def _render_page_2(self):
         if self._is_player_retired():
             return [self._retirement_banner()], self._build_weather_lines()
+        if self.session_type not in RACE_SESSION_TYPES:
+            return [], self._build_weather_lines()
         if self._is_race_start():
             return ["Pit projection unavailable on lap 1"], self._build_weather_lines()
 
         player = self.lap_summary.get(self.player_car_index)
         if not player or player.get("position", 0) <= 0:
-            return [f"{'Pit?':<5} {'-':<10} {'-':>9} {'-':>9}"], ["No lap data yet"]
+            return [
+                f"{'Pit?':<5} {_col('-', 9)} "
+                f"{_col('-', 8, right=True)} {_col('-', 8, right=True)}"
+            ], ["No lap data yet"]
 
         player_pos = player["position"]
         player_delta_to_leader = player["delta_to_leader"]
@@ -996,7 +1058,9 @@ class F1OverlayApp:
         loss_text = f"loss{loss_marker}{pit_loss:.0f}s"
 
         top_lines = [
-            f"{'Pit?':<5} {projected_position_text:<10} {ahead_text:>9} {behind_text:>9}  {loss_text}"
+            f"{'Pit?':<5} {_col(projected_position_text, 9)} "
+            f"{_col(ahead_text, 8, right=True)} {_col(behind_text, 8, right=True)}  "
+            f"{_col(loss_text, 8)}"
         ]
 
         # Penalties yet to be served — shown separately so the projection above
@@ -1012,7 +1076,7 @@ class F1OverlayApp:
                 parts.append(f"{unserved_dt}xDT(+{owed_dt}s)")
             if unserved_sg:
                 parts.append(f"{unserved_sg}xSG(+{owed_sg}s)")
-            top_lines.append(f"Pen owed: {' '.join(parts)} = +{owed_total}s")
+            top_lines.append(f"Pen owed: {_col(' '.join(parts), 30)} = +{owed_total}s")
 
         return top_lines, self._build_weather_lines()
 
@@ -1026,9 +1090,8 @@ class F1OverlayApp:
         return format_signed_seconds(signed)
 
     def _refresh_ui(self, stale_state):
-        if stale_state == "no_data":
-            self.cars_var.set(f"Waiting for telemetry on UDP {UDP_PORT}...")
-            self.weather_var.set("")
+        if stale_state == "no_data" or self.session_type not in ACTIVE_SESSION_TYPES:
+            self.page_var.set(_compose_page([f"Waiting for telemetry on UDP {UDP_PORT}..."]))
             return
 
         render_fn = self.page_renderers.get(self.active_page_index, self.page_renderers[1])
@@ -1040,8 +1103,7 @@ class F1OverlayApp:
             cars_lines = ["[NO SIGNAL]"] + list(cars_lines)
             weather_lines = []
 
-        self.cars_var.set("\n".join(cars_lines))
-        self.weather_var.set("\n".join(weather_lines))
+        self.page_var.set(_compose_page([*cars_lines, *weather_lines]))
 
     def run(self):
         self.root.mainloop()
