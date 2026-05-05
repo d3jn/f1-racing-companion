@@ -16,7 +16,7 @@ This overlay listens to UDP telemetry packets from F1 25 game and displays real-
 
 ## Configuration
 
-Create a `settings.json` file in the project root with the following structure:
+All the settings are available in `settings.json` file in the project root with the following structure:
 
 ```json
 {

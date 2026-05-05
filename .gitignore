@@ -21,9 +21,6 @@ ENV/
 *.swp
 *.swo
 
-# Configuration and local settings
-settings.json
-
 # OS files
 .DS_Store
 Thumbs.db

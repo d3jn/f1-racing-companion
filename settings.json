@@ -1,0 +1,7 @@
+{
+    "udp_port": 20777,
+    "borderless": false,
+    "always_on_top": false,
+    "smart_pit_projection": false,
+    "drivers": []
+}
