@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Project Logo" width="128">
+</p>
+
 # F1 Racing Companion
 
 A real-time Formula 1 telemetry overlay that connects to the F1 25 game via UDP and displays live race information.
@@ -6,9 +10,9 @@ A real-time Formula 1 telemetry overlay that connects to the F1 25 game via UDP 
 
 This overlay listens to UDP telemetry packets from F1 25 game and displays real-time information such as weather conditions, tire wear, ERS levels/mode, standings with deltas relative to the player and other race data (when it's available). It even has a very simple pit projection, but you need to test and adjust time lost in the pits first.
 
-**Note:** This overlay was created for VR use and thus is not displayed in the borderless stay-on-top window itself.
-
 ## Installation
+
+Download an existing release containing the exe file. Or if you want to build from run/build from source:
 
 1. Clone the repository
 2. Create a `settings.json` file in the root directory (see Configuration section)
