@@ -606,7 +606,7 @@ class F1OverlayApp:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("F125 Race Engineer Overlay")
+        self.root.title("F1 Racing Companion")
         self.root.configure(bg="black")
         if BORDERLESS:
             self.root.overrideredirect(True)
