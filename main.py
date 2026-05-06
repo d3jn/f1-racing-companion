@@ -595,6 +595,10 @@ class F1OverlayApp:
         self.page_label.bind("<Button-1>", self._start_move)
         self.page_label.bind("<B1-Motion>", self._do_move)
 
+        self._context_menu = tk.Menu(self.root, tearoff=0)
+        self._context_menu.add_command(label="Exit", command=self._on_exit)
+        self.page_label.bind("<Button-3>", self._show_context_menu)
+
     def _start_move(self, event):
         self._drag_offset_x = event.x_root - self.root.winfo_x()
         self._drag_offset_y = event.y_root - self.root.winfo_y()
@@ -603,6 +607,15 @@ class F1OverlayApp:
         new_x = event.x_root - self._drag_offset_x
         new_y = event.y_root - self._drag_offset_y
         self.root.geometry(f"+{new_x}+{new_y}")
+
+    def _show_context_menu(self, event):
+        try:
+            self._context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._context_menu.grab_release()
+
+    def _on_exit(self):
+        self.root.destroy()
 
     def _udp_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
