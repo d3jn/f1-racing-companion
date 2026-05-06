@@ -1195,6 +1195,8 @@ class F1OverlayApp:
     def _render_page_3(self):
         if self._is_player_retired():
             return [self._retirement_banner()], []
+        if self.session_type not in RACE_SESSION_TYPES:
+            return [], []
 
         best = self._sector_tracker.best_per_compound_sector()
 
