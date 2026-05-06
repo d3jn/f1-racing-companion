@@ -134,8 +134,6 @@ RACE_START_LAP_DISTANCE_M = 800
 
 # Tyre wear projection target — laps-left is computed against this threshold
 WEAR_TARGET_PCT = 80
-WEAR_HISTORY_LEN = 6
-WEAR_RATE_NEGLIGIBLE = 0.05
 
 # Per-track pit-loss baselines (green / safety car), in seconds.
 # Real-world estimates; tune per league as needed.
@@ -528,46 +526,134 @@ def get_car_info(car_idx, car_statuses, car_damages):
 
 
 class WearTracker:
-    """Records per-car tyre wear samples and computes degradation rate."""
+    """
+    Tracks each car's most recent *clean full lap* of tyre-wear delta on the
+    current compound. A clean full lap is one that ran from one SF crossing
+    to the next without an intervening compound change and with the start
+    snapshot taken at a true SF crossing (not at a mid-stream join or pit).
+
+    Used to project laps-left on the player's current stint via
+    `(target_pct - current_wear) / last_lap_wear_delta`.
+    """
 
     def __init__(self, target_pct=WEAR_TARGET_PCT):
         self.target_pct = target_pct
-        self._history = {}    # car_idx -> [(lap_num, max_wear), ...]
-        self._last_age = {}   # car_idx -> last seen tyres_age_laps
+        # car_idx -> {lap, compound, wear, clean_start}
+        # clean_start: True if `wear` was sampled at an SF crossing.
+        self._lap_start = {}
+        # car_idx -> (compound, lap_wear_delta) from the most recent clean
+        # full lap. Cleared on compound change, lap-num jump, fresh tyres,
+        # and any non-clean rollover.
+        self._last_lap_wear = {}
+        self._last_age = {}
 
-    def observe(self, car_idx, lap_num, max_wear, tyres_age_laps):
-        if lap_num <= 0:
+    def observe(self, car_idx, lap_num, max_wear, compound, tyres_age_laps):
+        if lap_num <= 0 or compound is None:
             return
+
+        # Fresh tyres detected (age went backwards) — wipe state.
         prev_age = self._last_age.get(car_idx)
         if prev_age is not None and tyres_age_laps < prev_age:
-            self._history[car_idx] = []  # Fresh tyres fitted
+            self._lap_start.pop(car_idx, None)
+            self._last_lap_wear.pop(car_idx, None)
         self._last_age[car_idx] = tyres_age_laps
 
-        history = self._history.setdefault(car_idx, [])
-        if history and history[-1][0] == lap_num:
-            history[-1] = (lap_num, max_wear)
-        else:
-            history.append((lap_num, max_wear))
-            if len(history) > WEAR_HISTORY_LEN:
-                history.pop(0)
+        prev = self._lap_start.get(car_idx)
 
-    def degradation(self, car_idx):
-        """Returns (rate_per_lap, laps_to_target) — either may be None."""
-        history = self._history.get(car_idx, [])
-        if len(history) < 2:
-            return None, None
-        first_lap, first_wear = history[0]
-        last_lap, last_wear = history[-1]
-        lap_span = last_lap - first_lap
-        if lap_span <= 0:
-            return None, None
-        rate = (last_wear - first_wear) / lap_span
-        if rate <= WEAR_RATE_NEGLIGIBLE:
-            return rate, None
-        if last_wear >= self.target_pct:
-            return rate, 0.0
-        laps_to_target = (self.target_pct - last_wear) / rate
-        return rate, max(0.0, laps_to_target)
+        if prev is None:
+            # First observation: snapshot but mark not-clean — we don't know
+            # whether we caught the lap right at SF or partway through.
+            self._lap_start[car_idx] = {
+                "lap": lap_num, "compound": compound,
+                "wear": max_wear, "clean_start": False,
+            }
+            return
+
+        if lap_num == prev["lap"]:
+            # Mid-lap. Detect compound change → pit stop.
+            if compound != prev["compound"]:
+                self._lap_start[car_idx] = {
+                    "lap": lap_num, "compound": compound,
+                    "wear": max_wear, "clean_start": False,
+                }
+                self._last_lap_wear.pop(car_idx, None)
+            return
+
+        # Lap rolled over.
+        if (lap_num == prev["lap"] + 1
+                and compound == prev["compound"]
+                and prev["clean_start"]):
+            delta = max_wear - prev["wear"]
+            if delta > 0:
+                self._last_lap_wear[car_idx] = (compound, delta)
+            else:
+                self._last_lap_wear.pop(car_idx, None)
+        else:
+            # Couldn't measure a clean full lap — drop any stale estimate.
+            self._last_lap_wear.pop(car_idx, None)
+
+        # The current packet is the SF-crossing snapshot for the new lap.
+        self._lap_start[car_idx] = {
+            "lap": lap_num, "compound": compound,
+            "wear": max_wear, "clean_start": True,
+        }
+
+    def last_lap_wear(self, car_idx):
+        """(compound, lap_wear_delta) for the most recent clean full lap, or None."""
+        return self._last_lap_wear.get(car_idx)
+
+
+class ErsTracker:
+    """
+    Tracks the player's ERS battery level at SF crossings to expose two
+    page-1 deltas:
+      prev: change across the last completed lap (history[-1] - history[-2])
+      now:  change since the most recent SF crossing (current - history[-1])
+
+    On lap 1 (no SF crossings observed yet) the `now` baseline is 100% per
+    F1 race-start convention. Lap-num jumps > 1 (packet loss / restart)
+    wipe the history so a stale `prev` can't span a missing lap.
+    """
+
+    HISTORY = 3
+
+    def __init__(self):
+        self._history = []
+        self._last_lap_num = None
+
+    def observe(self, lap_num, ers_pct):
+        if not lap_num or lap_num <= 0:
+            return
+        if self._last_lap_num is None:
+            self._last_lap_num = lap_num
+            return
+        if lap_num == self._last_lap_num:
+            return
+        if lap_num == self._last_lap_num + 1:
+            # Clean rollover — current ers_pct is the value at SF crossing,
+            # which equals end-of-just-completed-lap.
+            self._history.append(ers_pct)
+            while len(self._history) > self.HISTORY:
+                self._history.pop(0)
+        else:
+            # Non-monotonic / multi-lap jump → discard stale history.
+            self._history = []
+        self._last_lap_num = lap_num
+
+    def deltas(self, current_ers_pct):
+        """(prev_delta, now_delta) — either may be None when not measurable."""
+        if self._history:
+            now_delta = current_ers_pct - self._history[-1]
+        elif self._last_lap_num == 1:
+            # Race-start baseline: full battery.
+            now_delta = current_ers_pct - 100.0
+        else:
+            # Mid-stream join with no SF crossing observed yet — no baseline.
+            return (None, None)
+
+        prev_delta = (self._history[-1] - self._history[-2]
+                      if len(self._history) >= 2 else None)
+        return (prev_delta, now_delta)
 
 
 class SectorTracker:
@@ -978,6 +1064,7 @@ class F1OverlayApp:
 
         self._wear_tracker = WearTracker()
         self._sector_tracker = SectorTracker()
+        self._ers_tracker = ErsTracker()
         self._lap_logger = LapLogger(_base_dir, LOG_LAPS, TELEMETRY_VERY_STALE_S)
 
         # Cross-thread wake-up signal. The actual data lives in instance dicts;
@@ -1096,7 +1183,17 @@ class F1OverlayApp:
                 car_idx,
                 lap_info.get("current_lap_num", 0),
                 max_wear,
+                TYRE_COMPOUNDS.get(status.get("visual_tyre")),
                 status.get("tyres_age_laps", 0),
+            )
+
+        # ERS tracker — player only.
+        player_lap = self.lap_summary.get(self.player_car_index)
+        player_status = self.car_statuses.get(self.player_car_index)
+        if player_lap and player_status:
+            ers_pct = (player_status.get("ers_store", 0) / ERS_MAX_ENERGY) * 100
+            self._ers_tracker.observe(
+                player_lap.get("current_lap_num", 0), ers_pct,
             )
 
         # Lap logger only cares about the player car.
@@ -1299,30 +1396,40 @@ class F1OverlayApp:
     def _build_player_extras(self, player):
         lines = []
 
-        rate, laps_left = self._wear_tracker.degradation(self.player_car_index)
         damage = self.car_damages.get(self.player_car_index)
+        status = self.car_statuses.get(self.player_car_index)
+        current_compound = (TYRE_COMPOUNDS.get(status.get("visual_tyre"))
+                            if status else None)
+
         if damage:
             wear = damage["tyre_wear"]
             max_wear = max(wear)
             corner = TYRE_NAMES[wear.index(max_wear)]
-            if rate is None:
-                deg_text = "deg ?/lap"
-            elif rate <= WEAR_RATE_NEGLIGIBLE:
-                deg_text = "stable"
-            else:
-                left = f"~{laps_left:.0f}L left" if laps_left is not None else "-"
-                deg_text = f"+{rate:.1f}/lap {left}"
-            lines.append(f"Tyre: {max_wear:.0f}% ({corner}) {_col(deg_text, 22)}")
+            last = self._wear_tracker.last_lap_wear(self.player_car_index)
 
-        status = self.car_statuses.get(self.player_car_index)
+            if (last is not None and current_compound is not None
+                    and last[0] == current_compound and last[1] > 0):
+                last_delta = last[1]
+                if max_wear >= WEAR_TARGET_PCT:
+                    deg_text = f"+{last_delta:.1f}/lap ~0L left"
+                else:
+                    laps_left = (WEAR_TARGET_PCT - max_wear) / last_delta
+                    deg_text = f"+{last_delta:.1f}/lap ~{laps_left:.0f}L left"
+                lines.append(f"Tyre: {max_wear:.0f}% ({corner}) {deg_text}")
+            else:
+                lines.append(f"Tyre: {max_wear:.0f}% ({corner})")
+
         if status:
-            net = (status.get("ers_harvested_mguk", 0)
-                   + status.get("ers_harvested_mguh", 0)
-                   - status.get("ers_deployed", 0))
-            net_pct = (net / ERS_MAX_ENERGY) * 100
             store_pct = (status.get("ers_store", 0) / ERS_MAX_ENERGY) * 100
             ers_mode = ERS_MODES.get(status.get("ers_mode", 0), "?")
-            lines.append(f"ERS: {store_pct:.0f}% ({net_pct:+.1f}% lap) {ers_mode}")
+            prev_delta, now_delta = self._ers_tracker.deltas(store_pct)
+            if prev_delta is not None and now_delta is not None:
+                deltas_text = f"prev {prev_delta:+.1f}%, now {now_delta:+.1f}%"
+                lines.append(f"ERS: {store_pct:.0f}% ({deltas_text}) {ers_mode}")
+            elif now_delta is not None:
+                lines.append(f"ERS: {store_pct:.0f}% (now {now_delta:+.1f}%) {ers_mode}")
+            else:
+                lines.append(f"ERS: {store_pct:.0f}% {ers_mode}")
 
         return lines
 
