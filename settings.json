@@ -2,6 +2,7 @@
     "udp_port": 20777,
     "borderless": false,
     "always_on_top": false,
+    "opacity": 1,
     "drivers": [],
     "pitstop_time_lost": {
         "melbourne":         {"pitstop_time": 19, "sc_pitstop_time": 13},

@@ -24,6 +24,17 @@ BORDERLESS = bool(_settings.get("borderless", False))
 ALWAYS_ON_TOP = bool(_settings.get("always_on_top", False))
 
 
+def _parse_opacity(value):
+    if isinstance(value, bool):
+        return 1.0
+    if isinstance(value, (int, float)) and 0 < value <= 1:
+        return float(value)
+    return 1.0
+
+
+OPACITY = _parse_opacity(_settings.get("opacity", 1.0))
+
+
 def _normalize_race_number(num):
     s = str(num).strip().lstrip("0")
     return s if s else "0"
@@ -545,6 +556,8 @@ class F1OverlayApp:
         self.root.configure(bg="black")
         if BORDERLESS:
             self.root.overrideredirect(True)
+            if OPACITY < 1.0:
+                self.root.wm_attributes("-alpha", OPACITY)
         if ALWAYS_ON_TOP:
             self.root.wm_attributes("-topmost", True)
 
