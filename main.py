@@ -656,10 +656,18 @@ class SectorTracker:
             del laps[stale]
 
     def best_per_compound_sector(self):
-        """(compound, sector_idx) -> best time (seconds) across all cars' last 3 laps."""
-        best = {}
-        for laps in self._car_laps.values():
-            for entry in laps.values():
+        """
+        (compound, sector_idx) -> (best_time_seconds, is_hot).
+
+        `is_hot` is True when the time was set on the holder's most-recent
+        instance of that sector. A new sector completion by the holder flips
+        it off (slower/equal new time keeps the cell value but drops `[!]`;
+        faster new time updates the cell to the new value and keeps `[!]`).
+        """
+        # Step 1: find the (time, car, lap) that owns the best per bucket.
+        owners = {}  # (compound, sector_idx) -> (time, car_idx, lap_num)
+        for car_idx, laps in self._car_laps.items():
+            for ln, entry in laps.items():
                 for sector_idx, t_key, c_key in (
                     (0, "s1", "c1"), (1, "s2", "c2"), (2, "s3", "c3"),
                 ):
@@ -668,9 +676,34 @@ class SectorTracker:
                     if t is None or c is None:
                         continue
                     key = (c, sector_idx)
-                    if key not in best or t < best[key]:
-                        best[key] = t
-        return best
+                    if key not in owners or t < owners[key][0]:
+                        owners[key] = (t, car_idx, ln)
+
+        # Step 2: compute hot flag per holder.
+        result = {}
+        for key, (t, car_idx, ln) in owners.items():
+            hot = self._is_holders_most_recent(car_idx, key[1], ln)
+            result[key] = (t, hot)
+        return result
+
+    def _is_holders_most_recent(self, car_idx, sector_idx, lap_num):
+        """True if `lap_num` is the holder's last finalized instance of `sector_idx`."""
+        laps = self._car_laps.get(car_idx, {})
+        if sector_idx == 0:
+            candidates = [ln for ln, e in laps.items() if e["s1_raw_ms"] is not None]
+            return bool(candidates) and max(candidates) == lap_num
+        if sector_idx == 1:
+            candidates = [ln for ln, e in laps.items() if e["s2_raw_ms"] is not None]
+            return bool(candidates) and max(candidates) == lap_num
+        if sector_idx == 2:
+            # S3 finalizes at lap rollover; the most-recent finalized S3 is
+            # the lap before the car's currently-running one.
+            state = self._car_state.get(car_idx, {})
+            last_lap = state.get("last_lap")
+            if last_lap is None or last_lap < 2:
+                return False
+            return last_lap - 1 == lap_num
+        return False
 
 
 class F1OverlayApp:
@@ -1168,32 +1201,42 @@ class F1OverlayApp:
         # Per-column overall fastest across all compounds, used both for the
         # "is this row the fastest" check and for delta computation.
         column_best = {}  # sector_idx -> (compound, time)
-        for (compound, sector_idx), t in best.items():
+        for (compound, sector_idx), (t, _hot) in best.items():
             existing = column_best.get(sector_idx)
             if existing is None or t < existing[1]:
                 column_best[sector_idx] = (compound, t)
 
         lines = ["Best sectors per compound (last 3 laps, all cars)"]
         lines.append(
-            f"{_col('', 4)} {_col('S1', 9, right=True)} "
-            f"{_col('S2', 9, right=True)} {_col('S3', 9, right=True)}"
+            f"{_col('', 6)} {_col('S1', 12, right=True)} "
+            f"{_col('S2', 12, right=True)} {_col('S3', 12, right=True)}"
         )
 
         for compound in ("SOF", "MED", "HAR", "INT", "WET"):
             cells = []
             for sector_idx in (0, 1, 2):
-                t = best.get((compound, sector_idx))
+                entry = best.get((compound, sector_idx))
                 col = column_best.get(sector_idx)
-                if t is None:
+                if entry is None:
                     cells.append("-")
-                elif col is not None and col[0] == compound:
-                    cells.append(f"{t:.3f}")
                 else:
-                    delta = t - col[1]
-                    cells.append(f"{delta:+.3f}")
+                    t, hot = entry
+                    if col is not None and col[0] == compound:
+                        text = f"{t:.3f}"
+                    else:
+                        delta = t - col[1]
+                        text = f"{delta:+.3f}"
+                    if hot:
+                        text = f"{text} [!]"
+                    cells.append(text)
+            stars = sum(
+                1 for sector_idx in (0, 1, 2)
+                if column_best.get(sector_idx, (None,))[0] == compound
+            )
+            label = compound + ("*" * stars)
             lines.append(
-                f"{_col(compound, 4)} {_col(cells[0], 9, right=True)} "
-                f"{_col(cells[1], 9, right=True)} {_col(cells[2], 9, right=True)}"
+                f"{_col(label, 6)} {_col(cells[0], 12, right=True)} "
+                f"{_col(cells[1], 12, right=True)} {_col(cells[2], 12, right=True)}"
             )
 
         return lines, []
