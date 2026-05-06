@@ -37,6 +37,19 @@ OPACITY = _parse_opacity(_settings.get("opacity", 1.0))
 LOG_LAPS = bool(_settings.get("log_laps", False))
 
 
+def _parse_positive_int(value, default):
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int) and value > 0:
+        return value
+    return default
+
+
+PAGE_INNER_WIDTH = _parse_positive_int(_settings.get("width"), 53)
+PAGE_INNER_HEIGHT = _parse_positive_int(_settings.get("height"), 23)
+FONT_SIZE = _parse_positive_int(_settings.get("font_size"), 9)
+
+
 def _normalize_race_number(num):
     s = str(num).strip().lstrip("0")
     return s if s else "0"
@@ -424,8 +437,6 @@ def _col(value, width, right=False):
     return s.rjust(width) if right else s.ljust(width)
 
 
-PAGE_INNER_WIDTH = 53
-PAGE_INNER_HEIGHT = 23
 _BORDER_TOP = "┌" + "─" * PAGE_INNER_WIDTH + "┐"
 _BORDER_BOTTOM = "└" + "─" * PAGE_INNER_WIDTH + "┘"
 
@@ -987,7 +998,7 @@ class F1OverlayApp:
         self.root.after(100, self._poll)
 
     def _build_ui(self):
-        font = ("Consolas", 9)
+        font = ("Consolas", FONT_SIZE)
 
         self.page_var = tk.StringVar()
         self.page_label = tk.Label(

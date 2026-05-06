@@ -29,6 +29,9 @@ All the settings are read from `settings.json` placed next to `main.py` (or next
     "always_on_top": false,
     "opacity": 1,
     "log_laps": false,
+    "width": 53,
+    "height": 23,
+    "font_size": 9,
     "drivers": [
         {
             "name": "DRIVER_NAME",
@@ -58,6 +61,10 @@ All the settings are read from `settings.json` placed next to `main.py` (or next
 - **`opacity`** (number, optional): Whole-window opacity from 0 to 1, applied only when `borderless` is `true`. Affects text as well as background. Default is `1` (fully opaque), `0.5` will be 50% and so on. Values outside `(0, 1]` or non-numeric are ignored and treated as `1`.
 
 - **`log_laps`** (boolean, optional): When `true`, every completed player lap (in/out laps included, incomplete ones skipped) is appended to a CSV under `laps/`. Filenames are `YYYY_MM_DD_<trackslug>_<session>_NNNN.csv` where session is one of `practice`, `qualifying`, `sprint_shootout`, `race`, `time_trial` and `NNNN` is the smallest unused 4-digit number for that key. A new file is created each time telemetry starts (and again if it stalls for more than ~10s, or if the session/track changes mid-stream). Columns are: lap time `MM:SS.mmm`, lap time in seconds, tyre compound (`SOF`/`MED`/`HAR`/`INT`/`WET`), fuel on lap start (kg), tyre wear on lap start (%, worst corner), tyre wear delta over the lap, fuel consumption delta over the lap (positive = burned), and ERS used (% of full pack deployed during the lap). Default is `false`.
+
+- **`width`** / **`height`** (integers, optional): Inner content area of the overlay's bordered box, in characters and rows. Defaults are `53` and `23`. The bordered frame adds 2 to each (so the actual window is `width+2` × `height+2`). Lines from a renderer that exceed `width` are hard-cropped at the right edge; rendering fewer lines than `height` pads the rest with blanks. Going below the natural content widths will chop columns — the page-3 sector table needs ~45 chars to fit cleanly, the page-2 standings rows around 50.
+
+- **`font_size`** (integer, optional): Tk point size for the Consolas font used by the overlay. Default is `9`. Larger values make the whole window bigger because the box is sized in characters/rows; pair with adjusted `width`/`height` if you need both to scale.
 
 - **`drivers`** (array): A list of driver objects with custom names and numbers. This allows you to map custom display names to driver numbers for your league or session.
   - **`name`** (string): The display name for the driver
