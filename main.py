@@ -1193,15 +1193,21 @@ class F1OverlayApp:
         return self.participant_names.get(car_idx, f"Car {car_idx}")
 
     def _build_weather_lines(self):
-        lines = []
+        if not self.weather_samples:
+            return ["No weather data yet"]
+        slots = []
         for i, s in enumerate(self.weather_samples, 1):
             weather = WEATHER_TYPES.get(s["weather"], f"?({s['weather']})")
-            lines.append(
+            slots.append(
                 f"{_col(i, 2)} {_col(s['time_offset'], 3, right=True)} min  "
                 f"{_col(weather, 3)}  {_col(s['rain_pct'], 3, right=True)}%"
             )
-        if not lines:
-            lines = ["No weather data yet"]
+        lines = []
+        for i in range(0, len(slots), 2):
+            if i + 1 < len(slots):
+                lines.append(f"{slots[i]} | {slots[i + 1]}")
+            else:
+                lines.append(slots[i])
         return lines
 
     def _build_grid_rows(self):
@@ -1214,13 +1220,25 @@ class F1OverlayApp:
         cars.sort()
         if not cars:
             return ["Awaiting grid data"]
-        lines = ["FORMATION / RACE START"]
-        for pos, idx, _info in cars:
+
+        rows = []
+        player_list_idx = None
+        for list_idx, (pos, idx, _info) in enumerate(cars):
             is_player = idx == self.player_car_index
+            if is_player:
+                player_list_idx = list_idx
             name = "------" if is_player else self._car_display_name(idx)
             tyre, _wear = get_compound_and_max_wear(idx, self.car_statuses, self.car_damages)
-            lines.append(f"{_col(pos, 2)} {_col(name, 12)} {_col(tyre, 3)}")
-        return lines
+            rows.append(f"{_col(pos, 2)} {_col(name, 12)} {_col(tyre, 3)}")
+
+        if player_list_idx is None:
+            window = rows[:11]
+        else:
+            start = max(0, player_list_idx - 5)
+            end = min(len(rows), player_list_idx + 6)
+            window = rows[start:end]
+
+        return ["FORMATION / RACE START", *window]
 
     def _build_standings_rows(self):
         player = self.lap_summary.get(self.player_car_index)
