@@ -79,6 +79,7 @@ All the settings are read from `settings.json` placed next to `main.py` (or next
 
 - **Page 1** — gap, tyre, wear, battery and ERS mode for the cars directly ahead and behind you, your own tyre wear with a degradation rate and laps-left estimate (until 80% because past this value there is a chance of having a puncture), your ERS state with this-lap harvest/deploy net, and a standings list of ±5 cars around your position.
 - **Page 2** — pit projection (where you'd come out, gap to who'd be ahead/behind you after the stop, expected pit loss, any pending penalties) and the weather forecast samples coming from the game.
+- **Page 3** — best S1/S2/S3 across all cars' last 3 laps broken down by tire compound (SOF, MED, HAR, INT, WET). Cells show an absolute time (e.g. `21.240`) when this compound is the fastest in that sector, otherwise a `+delta` to the column's best (e.g. `+0.250`), or `-` if no clean lap registered on that compound for that sector. Pit-lane segments are excluded — an in-lap doesn't count toward its S3 and an out-lap doesn't count toward its S1, so a slow trundle through pit lane can't sneak in as a sector time.
 
 ### Window controls
 
