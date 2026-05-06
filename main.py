@@ -57,6 +57,7 @@ LOG_LAPS = bool(_settings.get("log_laps", False))
 PAGE_INNER_WIDTH = _parse_positive_int(_settings.get("width"), 53)
 PAGE_INNER_HEIGHT = _parse_positive_int(_settings.get("height"), 23)
 FONT_SIZE = _parse_positive_int(_settings.get("font_size"), 9)
+AUTO_SIZE = bool(_settings.get("auto_size", False))
 
 
 def _normalize_race_number(num):
@@ -444,16 +445,25 @@ def _col(value, width, right=False):
     return s.rjust(width) if right else s.ljust(width)
 
 
-_BORDER_TOP = "┌" + "─" * PAGE_INNER_WIDTH + "┐"
-_BORDER_BOTTOM = "└" + "─" * PAGE_INNER_WIDTH + "┘"
-
-
 def _compose_page(lines):
-    body = [_col(line, PAGE_INNER_WIDTH) for line in lines[:PAGE_INNER_HEIGHT]]
-    while len(body) < PAGE_INNER_HEIGHT:
-        body.append(" " * PAGE_INNER_WIDTH)
+    if AUTO_SIZE:
+        # Wrap the box exactly around the rendered content. Empty content
+        # still draws a minimal 1x1 box so the window doesn't collapse.
+        if not lines:
+            lines = [""]
+        width = max((len(line) for line in lines), default=1)
+        body = [line.ljust(width) for line in lines]
+    else:
+        # Fixed dimensions from settings: hard-crop wide lines and pad short
+        # rosters to the configured height.
+        body = [_col(line, PAGE_INNER_WIDTH) for line in lines[:PAGE_INNER_HEIGHT]]
+        while len(body) < PAGE_INNER_HEIGHT:
+            body.append(" " * PAGE_INNER_WIDTH)
+        width = PAGE_INNER_WIDTH
+    top = "┌" + "─" * width + "┐"
+    bottom = "└" + "─" * width + "┘"
     middle = [f"│{line}│" for line in body]
-    return "\n".join([_BORDER_TOP, *middle, _BORDER_BOTTOM])
+    return "\n".join([top, *middle, bottom])
 
 
 def lap_diff_between(other, player):

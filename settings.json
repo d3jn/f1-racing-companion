@@ -6,6 +6,7 @@
     "log_laps": false,
     "width": 53,
     "height": 23,
+    "auto_size": false,
     "font_size": 9,
     "drivers": [],
     "pitstop_time_lost": {
