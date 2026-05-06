@@ -12,22 +12,22 @@ This overlay listens to UDP telemetry packets from F1 25 game and displays real-
 
 ## Installation
 
-Download an existing release containing the exe file. Or if you want to run/build from source:
+Download an existing release containing the exe file and create `settings.json` file next to it (you can use the one supplied with the repository as a good starting point). 
+
+If you want to run/build from source:
 
 1. Clone the repository
-2. Create a `settings.json` file in the root directory (see Configuration section)
-3. Run `main.py` directly with Python or build it as an executable
+2. Run `main.py` directly with Python or build it as an executable
 
 ## Configuration
 
-All the settings are available in `settings.json` file in the project root with the following structure:
+All the settings are read from `settings.json` file if it exists. Example:
 
 ```json
 {
     "udp_port": 20777,
     "borderless": false,
     "always_on_top": false,
-    "smart_pit_projection": false,
     "drivers": [
         {
             "name": "DRIVER_NAME",
@@ -37,7 +37,12 @@ All the settings are available in `settings.json` file in the project root with 
             "name": "ANOTHER_DRIVER",
             "number": "2"
         }
-    ]
+    ],
+    "pitstop_time_lost": {
+        "monaco":            {"pitstop_time": 17, "sc_pitstop_time": 12},
+        "spa_francorchamps": {"pitstop_time": 20, "sc_pitstop_time": 14},
+        "monza":             {"pitstop_time": 25, "sc_pitstop_time": 17}
+    }
 }
 ```
 
@@ -49,11 +54,11 @@ All the settings are available in `settings.json` file in the project root with 
 
 - **`always_on_top`** (boolean): When `true`, keeps the overlay window above other windows even when it loses focus. Default is `false`. Leave it off if you're compositing through SteamVR — the host handles z-ordering for you.
 
-- **`smart_pit_projection`** (boolean): When `true`, the app records your pit stop times during the race and uses those measured values to refine the pit projection on page 2. When `false`, only the hardcoded baseline values are used. Default is `false`. This setting is experimental and requires a lot of clean stops to calibrate per track before it pays off, so leave it off unless you're willing to tune it across many sessions.
-
 - **`drivers`** (array): A list of driver objects with custom names and numbers. This allows you to map custom display names to driver numbers for your league or session.
   - **`name`** (string): The display name for the driver
   - **`number`** (string): The driver number as used in the game
+
+- **`pitstop_time_lost`** (object, optional): Per-track pit-loss times in seconds, used by pit projection. Keys are circuit slugs; values are objects with `pitstop_time` (green flag) and `sc_pitstop_time` (under safety car / VSC). Any track you don't list here falls back to the built-in defaults, so you only need to override the ones you've measured for your league. Available slugs: `melbourne`, `paul_ricard`, `shanghai`, `sakhir`, `catalunya`, `monaco`, `montreal`, `silverstone`, `hockenheim`, `hungaroring`, `spa_francorchamps`, `monza`, `marina_bay`, `suzuka`, `yas_marina`, `austin`, `interlagos`, `red_bull_ring`, `sochi`, `mexico_city`, `baku`, `sakhir_short`, `silverstone_short`, `austin_short`, `suzuka_short`, `hanoi`, `zandvoort`, `imola`, `portimao`, `jeddah`, `miami`, `las_vegas`, `losail`.
 
 ## Building
 

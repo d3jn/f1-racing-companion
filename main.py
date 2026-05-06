@@ -16,14 +16,12 @@ if getattr(sys, 'frozen', False):
 else:
     _base_dir = os.path.dirname(os.path.abspath(__file__))
 _settings_path = os.path.join(_base_dir, "settings.json")
-_pit_calibration_path = os.path.join(_base_dir, "pit_calibration.json")
 
 with open(_settings_path, "r") as _f:
     _settings = json.load(_f)
 UDP_PORT = _settings["udp_port"]
 BORDERLESS = bool(_settings.get("borderless", False))
 ALWAYS_ON_TOP = bool(_settings.get("always_on_top", False))
-SMART_PIT_PROJECTION = bool(_settings.get("smart_pit_projection", False))
 
 
 def _normalize_race_number(num):
@@ -113,18 +111,8 @@ WEAR_TARGET_PCT = 80
 WEAR_HISTORY_LEN = 6
 WEAR_RATE_NEGLIGIBLE = 0.05
 
-# Pit calibration sanity bounds and rolling-window length
-PIT_LOSS_MIN_S = 12
-PIT_LOSS_MAX_S = 50
-PIT_CALIBRATION_SAMPLES = 3
-# Front-wing damage threshold above which we assume a wing was replaced when
-# the post-stop value drops to ~0
-FW_REPLACED_PRE_DAMAGE_THRESHOLD = 5
-FW_REPLACED_POST_DAMAGE_THRESHOLD = 1
-
 # Per-track pit-loss baselines (green / safety car), in seconds.
-# Values are real-world estimates; PitCalibrator overrides per-track once it
-# observes a clean stop (tires only, no front wing replacement, no penalty served).
+# Real-world estimates; tune per league as needed.
 PITSTOP_TIMES = {
     -1: {"pitstop_time": 21, "sc_pitstop_time": 14},  # Unknown track — generic
      0: {"pitstop_time": 19, "sc_pitstop_time": 13},  # Melbourne       - Australian GP
@@ -161,6 +149,76 @@ PITSTOP_TIMES = {
     31: {"pitstop_time": 19, "sc_pitstop_time": 13},  # Las Vegas       - Las Vegas GP
     32: {"pitstop_time": 21, "sc_pitstop_time": 14},  # Losail          - Qatar GP
 }
+
+# Slug → game track_id. Slugs are what users put in settings.json under
+# `pitstop_time_lost`; track_id is what the F1 telemetry packet sends.
+TRACK_SLUG_TO_ID = {
+    "melbourne": 0,
+    "paul_ricard": 1,
+    "shanghai": 2,
+    "sakhir": 3,
+    "catalunya": 4,
+    "monaco": 5,
+    "montreal": 6,
+    "silverstone": 7,
+    "hockenheim": 8,
+    "hungaroring": 9,
+    "spa_francorchamps": 10,
+    "monza": 11,
+    "marina_bay": 12,
+    "suzuka": 13,
+    "yas_marina": 14,
+    "austin": 15,
+    "interlagos": 16,
+    "red_bull_ring": 17,
+    "sochi": 18,
+    "mexico_city": 19,
+    "baku": 20,
+    "sakhir_short": 21,
+    "silverstone_short": 22,
+    "austin_short": 23,
+    "suzuka_short": 24,
+    "hanoi": 25,
+    "zandvoort": 26,
+    "imola": 27,
+    "portimao": 28,
+    "jeddah": 29,
+    "miami": 30,
+    "las_vegas": 31,
+    "losail": 32,
+}
+
+
+def _build_effective_pit_times(user_dict):
+    """Overlay `pitstop_time_lost` settings onto PITSTOP_TIMES, keyed by track_id."""
+    effective = {tid: dict(values) for tid, values in PITSTOP_TIMES.items()}
+    if not isinstance(user_dict, dict):
+        if user_dict is not None:
+            print("Warning: 'pitstop_time_lost' in settings.json must be an object",
+                  file=sys.stderr)
+        return effective
+    for slug, values in user_dict.items():
+        track_id = TRACK_SLUG_TO_ID.get(slug)
+        if track_id is None:
+            print(f"Warning: unknown track slug '{slug}' in pitstop_time_lost",
+                  file=sys.stderr)
+            continue
+        if not isinstance(values, dict):
+            print(f"Warning: pitstop_time_lost['{slug}'] must be an object",
+                  file=sys.stderr)
+            continue
+        entry = effective.setdefault(track_id, dict(PITSTOP_TIMES[-1]))
+        green = values.get("pitstop_time")
+        sc = values.get("sc_pitstop_time")
+        if isinstance(green, (int, float)):
+            entry["pitstop_time"] = green
+        if isinstance(sc, (int, float)):
+            entry["sc_pitstop_time"] = sc
+    return effective
+
+
+_EFFECTIVE_PIT_TIMES = _build_effective_pit_times(_settings.get("pitstop_time_lost"))
+
 
 EVENT_CODE_BUTN = b"BUTN"
 UDP_ACTION_1_MASK = 0x00100000
@@ -231,11 +289,10 @@ def parse_session_packet(data):
     track_length_m = pre[4]
     session_type = pre[5]
     track_id = pre[6]
-    formula = pre[7]
 
     offset = HEADER_SIZE + PRE_MARSHAL_SIZE + MARSHAL_ZONE_SIZE * 21
     if offset + POST_MARSHAL_SIZE > len(data):
-        return [], track_id, formula, 0, track_length_m, session_type
+        return [], track_id, 0, track_length_m, session_type
 
     post = struct.unpack_from(POST_MARSHAL_FMT, data, offset)
     safety_car_status = post[0]
@@ -259,7 +316,7 @@ def parse_session_packet(data):
         })
         offset += WEATHER_SAMPLE_SIZE
 
-    return samples, track_id, formula, safety_car_status, track_length_m, session_type
+    return samples, track_id, safety_car_status, track_length_m, session_type
 
 
 def parse_lap_positions(data):
@@ -480,128 +537,6 @@ class WearTracker:
         return rate, max(0.0, laps_to_target)
 
 
-class PitCalibrator:
-    """
-    Tracks the player's pit stops and persists per-track pit-loss measurements.
-
-    A stop only contributes a sample if all of these hold:
-      - no penalty was served during the stop (unserved_dt/unserved_sg unchanged,
-        and pit_stop_should_serve_pen was false at pit-in);
-      - no front wing replacement (FL/FR damage didn't drop from significant
-        pre-stop values to ~0 post-stop);
-      - the resulting delta change is within sanity bounds.
-    """
-
-    def __init__(self, store_path, enabled=True):
-        self._path = store_path
-        self._enabled = enabled
-        self._data = self._load() if enabled else {}
-        self._state = "out"          # "out" | "in_pit" | "out_lap"
-        self._pre = None
-        self._exit_lap = None
-        self._suppress = None        # reason this sample is discarded, if any
-
-    def _load(self):
-        try:
-            with open(self._path, "r") as f:
-                d = json.load(f)
-                return d if isinstance(d, dict) else {}
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return {}
-
-    def _save(self):
-        try:
-            with open(self._path, "w") as f:
-                json.dump(self._data, f, indent=2)
-        except OSError:
-            pass
-
-    def observe(self, player_lap_info, fw_damage_max, track_id, formula, sc_status):
-        if not self._enabled:
-            return
-        if not player_lap_info:
-            return
-        pit_status = player_lap_info.get("pit_status", 0)
-        lap_num = player_lap_info.get("current_lap_num", 0)
-        delta = player_lap_info.get("delta_to_leader", 0.0)
-        unserved_dt = player_lap_info.get("unserved_dt", 0)
-        unserved_sg = player_lap_info.get("unserved_sg", 0)
-        should_serve = player_lap_info.get("pit_stop_should_serve_pen", 0)
-        result_status = player_lap_info.get("result_status", 0)
-
-        if result_status in RETIRED_STATUS_SET:
-            self._reset()
-            return
-
-        if self._state == "out":
-            if pit_status in (1, 2):
-                self._state = "in_pit"
-                self._pre = {
-                    "delta": delta,
-                    "lap": lap_num,
-                    "unserved_dt": unserved_dt,
-                    "unserved_sg": unserved_sg,
-                    "fw_damage": fw_damage_max,
-                    "sc_status": sc_status,
-                    "track_id": track_id,
-                    "formula": formula,
-                }
-                self._suppress = "penalty_due" if should_serve else None
-
-        elif self._state == "in_pit":
-            if (unserved_dt < self._pre["unserved_dt"]
-                    or unserved_sg < self._pre["unserved_sg"]):
-                self._suppress = "penalty_served"
-
-            if pit_status == 0:
-                self._state = "out_lap"
-                self._exit_lap = lap_num
-                if (self._pre["fw_damage"] >= FW_REPLACED_PRE_DAMAGE_THRESHOLD
-                        and fw_damage_max < FW_REPLACED_POST_DAMAGE_THRESHOLD):
-                    self._suppress = "fw_replaced"
-
-        elif self._state == "out_lap":
-            if pit_status in (1, 2):
-                self._reset()
-                return
-            if lap_num >= self._exit_lap + 2:
-                if self._suppress is None:
-                    pit_loss = delta - self._pre["delta"]
-                    self._record(self._pre["track_id"], self._pre["formula"],
-                                 self._pre["sc_status"], pit_loss)
-                self._reset()
-
-    def _record(self, track_id, formula, sc_status, pit_loss):
-        if pit_loss < PIT_LOSS_MIN_S or pit_loss > PIT_LOSS_MAX_S:
-            return
-        key = f"{track_id}:{formula}"
-        bucket = self._data.setdefault(key, {"green": [], "sc": []})
-        sc_active = sc_status in (1, 2)
-        target_list = bucket["sc"] if sc_active else bucket["green"]
-        target_list.append(round(pit_loss, 2))
-        while len(target_list) > PIT_CALIBRATION_SAMPLES:
-            target_list.pop(0)
-        self._save()
-
-    def _reset(self):
-        self._state = "out"
-        self._pre = None
-        self._exit_lap = None
-        self._suppress = None
-
-    def get_pit_loss(self, track_id, formula, sc_active):
-        """Returns (loss_seconds, measured_bool)."""
-        key = f"{track_id}:{formula}"
-        bucket = self._data.get(key)
-        if bucket:
-            samples = bucket["sc"] if sc_active else bucket["green"]
-            if samples:
-                return sum(samples) / len(samples), True
-        baseline = PITSTOP_TIMES.get(track_id, PITSTOP_TIMES[-1])
-        value = baseline["sc_pitstop_time"] if sc_active else baseline["pitstop_time"]
-        return float(value), False
-
-
 class F1OverlayApp:
 
     def __init__(self):
@@ -621,7 +556,6 @@ class F1OverlayApp:
         self.weather_samples = []
         self.track_id = -1
         self.track_length_m = 0
-        self.formula = 0
         self.safety_car_status = 0
         self.session_type = 0
         self.player_car_index = 0
@@ -632,7 +566,6 @@ class F1OverlayApp:
         self._last_stale_state = None
 
         self._wear_tracker = WearTracker()
-        self._pit_calibrator = PitCalibrator(_pit_calibration_path, enabled=SMART_PIT_PROJECTION)
 
         # Cross-thread wake-up signal. The actual data lives in instance dicts;
         # the queue is just a coalesced "something changed, please render" flag.
@@ -698,7 +631,7 @@ class F1OverlayApp:
                     self._signal()
                     continue
                 elif pid == PACKET_SESSION_DATA:
-                    (self.weather_samples, self.track_id, self.formula,
+                    (self.weather_samples, self.track_id,
                      self.safety_car_status, self.track_length_m,
                      self.session_type) = parse_session_packet(data)
                 else:
@@ -732,16 +665,6 @@ class F1OverlayApp:
                 max_wear,
                 status.get("tyres_age_laps", 0),
             )
-
-        player_lap = self.lap_summary.get(self.player_car_index)
-        player_damage = self.car_damages.get(self.player_car_index)
-        fw_max = 0
-        if player_damage:
-            fw_max = max(player_damage.get("fw_left", 0),
-                         player_damage.get("fw_right", 0))
-        self._pit_calibrator.observe(
-            player_lap, fw_max, self.track_id, self.formula, self.safety_car_status,
-        )
 
     def _handle_event_packet(self, data):
         button_state = parse_event_button_status(data)
@@ -1006,9 +929,8 @@ class F1OverlayApp:
         player_delta_to_leader = player["delta_to_leader"]
 
         sc_active = self.safety_car_status in (1, 2)
-        pit_loss, measured = self._pit_calibrator.get_pit_loss(
-            self.track_id, self.formula, sc_active,
-        )
+        baseline = _EFFECTIVE_PIT_TIMES.get(self.track_id, _EFFECTIVE_PIT_TIMES[-1])
+        pit_loss = float(baseline["sc_pitstop_time"] if sc_active else baseline["pitstop_time"])
 
         # Penalty served *during* the pit stop only counts when the game flag
         # says so. DT is served on its own pass — surfaced separately below.
@@ -1054,8 +976,7 @@ class F1OverlayApp:
         ahead_text = self._format_proj_gap(ahead_gap, "+", player, ahead_info) if ahead_info else "-"
         behind_text = self._format_proj_gap(behind_gap, "-", player, behind_info) if behind_info else "-"
 
-        loss_marker = "m" if measured else "~"
-        loss_text = f"loss{loss_marker}{pit_loss:.0f}s"
+        loss_text = f"loss {pit_loss:.0f}s"
 
         top_lines = [
             f"{'Pit?':<5} {_col(projected_position_text, 9)} "
