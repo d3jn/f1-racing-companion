@@ -8,7 +8,7 @@ A real-time Formula 1 telemetry overlay that connects to the F1 25 game via UDP 
 
 ## Overview
 
-This overlay listens to UDP telemetry packets from F1 25 game and displays real-time information such as weather conditions, tire wear and degradation, ERS levels/mode/harvest, standings with deltas relative to the player and other race data (when it's available). It also has a simple pit projection on its own page — the time lost in the pits is configurable per track in `settings.json` if you have your own measurements or want to add some buffer time to account for slower stops, damage repairs etc (default values are my rough estimates so trust them on your own risk).
+This overlay listens to UDP telemetry packets from F1 25 game and displays real-time information such as weather conditions, tire wear and degradation, ERS levels/mode/harvest, standings with deltas relative to the player and other race data (when it's available). It also has a simple pit projection on its own page — the time lost in the pits is configurable per track in `settings.json` if you have your own measurements or want to add some buffer time to account for slower stops, damage repairs etc (default values are my rough estimates so trust them on your own risk). And there's a separate per-compound sector-times page meant for mixed conditions — it shows the fastest S1/S2/S3 across all cars' last 3 laps split by tire compound, so you can see at a glance when slicks have crossed over wets (or the other way around).
 
 ## Installation
 

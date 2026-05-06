@@ -336,14 +336,19 @@ def parse_lap_positions(data):
     for i in range(NUM_CARS):
         lap = struct.unpack_from(LAP_DATA_FMT, data, offset)
         delta_to_leader = lap[9] * 60.0 + (lap[8] / 1000.0)
+        sector1_total_ms = lap[3] * 60_000 + lap[2]
+        sector2_total_ms = lap[5] * 60_000 + lap[4]
         summary[i] = {
             "last_lap_time_ms": lap[0],
             "delta_to_leader": delta_to_leader,
+            "sector1_total_ms": sector1_total_ms,
+            "sector2_total_ms": sector2_total_ms,
             "lap_distance": lap[10],
             "total_distance": lap[11],
             "position": lap[13],
             "current_lap_num": lap[14],
             "pit_status": lap[15],
+            "sector": lap[17],
             "penalties": lap[19],
             "unserved_dt": lap[22],
             "unserved_sg": lap[23],
@@ -548,6 +553,126 @@ class WearTracker:
         return rate, max(0.0, laps_to_target)
 
 
+class SectorTracker:
+    """
+    Tracks per-car sector times across each car's last 3 lap_nums and tags
+    each sector with the compound the car was on when that sector finalized.
+
+    A sector is recorded when its corresponding LAP_DATA field is populated
+    (S1 once `sector` reaches 1, S2 once it reaches 2, S3 at lap rollover via
+    `lastLapTime − S1 − S2`). A sector is *tainted* and skipped if pit_status
+    was nonzero at any observation during it — that catches both in-laps
+    (S3 in pit lane) and out-laps (S1 starting in pit lane).
+    """
+
+    HISTORY_LAPS = 3
+
+    def __init__(self):
+        # car_idx -> {lap_num -> entry}
+        # entry: {s1, s2, s3 (seconds | None), c1, c2, c3 (compound | None),
+        #         pit_s1, pit_s2, pit_s3 (bool)}
+        self._car_laps = {}
+        # car_idx -> {"last_lap": int | None}
+        self._car_state = {}
+
+    def _new_entry(self):
+        return {
+            # Raw sector times in ms — always populated when the sector
+            # finalizes, used for S3 math even when a sector is pit-tainted.
+            "s1_raw_ms": None, "s2_raw_ms": None,
+            # Table-eligible times: stay None when the sector overlapped pit lane.
+            "s1": None, "s2": None, "s3": None,
+            "c1": None, "c2": None, "c3": None,
+            "pit_s1": False, "pit_s2": False, "pit_s3": False,
+        }
+
+    def observe(self, car_idx, lap_info, status):
+        if not lap_info:
+            return
+        result_status = lap_info.get("result_status", 0)
+        if result_status not in ACTIVE_STATUS_SET:
+            # Drop a car's history once it's no longer active so stale data
+            # from a retired car can't sit forever in the table.
+            self._car_laps.pop(car_idx, None)
+            self._car_state.pop(car_idx, None)
+            return
+
+        lap_num = lap_info.get("current_lap_num", 0)
+        if lap_num <= 0:
+            return
+
+        sector = lap_info.get("sector", 0)
+        pit_status = lap_info.get("pit_status", 0)
+        last_lap_ms = lap_info.get("last_lap_time_ms", 0)
+        s1_total_ms = lap_info.get("sector1_total_ms", 0)
+        s2_total_ms = lap_info.get("sector2_total_ms", 0)
+        compound = TYRE_COMPOUNDS.get(status.get("visual_tyre")) if status else None
+
+        state = self._car_state.setdefault(car_idx, {"last_lap": None})
+        laps = self._car_laps.setdefault(car_idx, {})
+
+        # Lap rollover: finalize S3 of the just-completed lap. We use the
+        # raw S1/S2 (regardless of pit taint) since lastLapTime is the actual
+        # total sector time sum, and pit_s3 alone gates whether to record.
+        if state["last_lap"] is not None and lap_num != state["last_lap"]:
+            prev = laps.get(state["last_lap"])
+            if (prev is not None
+                    and prev["s1_raw_ms"] is not None and prev["s2_raw_ms"] is not None
+                    and last_lap_ms > 0 and not prev["pit_s3"]):
+                s3_ms = last_lap_ms - prev["s1_raw_ms"] - prev["s2_raw_ms"]
+                if s3_ms > 0:
+                    prev["s3"] = s3_ms / 1000.0
+                    prev["c3"] = compound
+
+        entry = laps.setdefault(lap_num, self._new_entry())
+
+        if pit_status != 0:
+            if sector == 0:
+                entry["pit_s1"] = True
+            elif sector == 1:
+                entry["pit_s2"] = True
+            elif sector == 2:
+                entry["pit_s3"] = True
+
+        # Capture raw S1/S2 once available (used for S3 math) and additionally
+        # store the table-eligible values + compound when the sector wasn't
+        # pit-tainted.
+        if sector >= 1 and entry["s1_raw_ms"] is None and s1_total_ms > 0:
+            entry["s1_raw_ms"] = s1_total_ms
+            if not entry["pit_s1"]:
+                entry["s1"] = s1_total_ms / 1000.0
+                entry["c1"] = compound
+        if sector >= 2 and entry["s2_raw_ms"] is None and s2_total_ms > 0:
+            entry["s2_raw_ms"] = s2_total_ms
+            if not entry["pit_s2"]:
+                entry["s2"] = s2_total_ms / 1000.0
+                entry["c2"] = compound
+
+        state["last_lap"] = lap_num
+
+        # Keep only the last HISTORY_LAPS lap_nums per car.
+        cutoff = lap_num - (self.HISTORY_LAPS - 1)
+        for stale in [ln for ln in laps if ln < cutoff]:
+            del laps[stale]
+
+    def best_per_compound_sector(self):
+        """(compound, sector_idx) -> best time (seconds) across all cars' last 3 laps."""
+        best = {}
+        for laps in self._car_laps.values():
+            for entry in laps.values():
+                for sector_idx, t_key, c_key in (
+                    (0, "s1", "c1"), (1, "s2", "c2"), (2, "s3", "c3"),
+                ):
+                    t = entry[t_key]
+                    c = entry[c_key]
+                    if t is None or c is None:
+                        continue
+                    key = (c, sector_idx)
+                    if key not in best or t < best[key]:
+                        best[key] = t
+        return best
+
+
 class F1OverlayApp:
 
     def __init__(self):
@@ -579,6 +704,7 @@ class F1OverlayApp:
         self._last_stale_state = None
 
         self._wear_tracker = WearTracker()
+        self._sector_tracker = SectorTracker()
 
         # Cross-thread wake-up signal. The actual data lives in instance dicts;
         # the queue is just a coalesced "something changed, please render" flag.
@@ -587,6 +713,7 @@ class F1OverlayApp:
         self.page_renderers = {
             1: self._render_page_1,
             2: self._render_page_2,
+            3: self._render_page_3,
         }
 
         self._build_ui()
@@ -678,10 +805,15 @@ class F1OverlayApp:
 
     def _update_trackers(self):
         for car_idx, lap_info in self.lap_summary.items():
+            status = self.car_statuses.get(car_idx)
+
+            # Sector tracker only needs lap data + compound from status.
+            # It handles its own active-status gating and missing-status case.
+            self._sector_tracker.observe(car_idx, lap_info, status)
+
             if lap_info.get("result_status", 0) not in ACTIVE_STATUS_SET:
                 continue
             damage = self.car_damages.get(car_idx)
-            status = self.car_statuses.get(car_idx)
             if not damage or not status:
                 continue
             max_wear = max(damage["tyre_wear"])
@@ -1026,6 +1158,45 @@ class F1OverlayApp:
             top_lines.append(f"Pen owed: {_col(' '.join(parts), 30)} = +{owed_total}s")
 
         return top_lines, self._build_weather_lines()
+
+    def _render_page_3(self):
+        if self._is_player_retired():
+            return [self._retirement_banner()], []
+
+        best = self._sector_tracker.best_per_compound_sector()
+
+        # Per-column overall fastest across all compounds, used both for the
+        # "is this row the fastest" check and for delta computation.
+        column_best = {}  # sector_idx -> (compound, time)
+        for (compound, sector_idx), t in best.items():
+            existing = column_best.get(sector_idx)
+            if existing is None or t < existing[1]:
+                column_best[sector_idx] = (compound, t)
+
+        lines = ["Best sectors per compound (last 3 laps, all cars)"]
+        lines.append(
+            f"{_col('', 4)} {_col('S1', 9, right=True)} "
+            f"{_col('S2', 9, right=True)} {_col('S3', 9, right=True)}"
+        )
+
+        for compound in ("SOF", "MED", "HAR", "INT", "WET"):
+            cells = []
+            for sector_idx in (0, 1, 2):
+                t = best.get((compound, sector_idx))
+                col = column_best.get(sector_idx)
+                if t is None:
+                    cells.append("-")
+                elif col is not None and col[0] == compound:
+                    cells.append(f"{t:.3f}")
+                else:
+                    delta = t - col[1]
+                    cells.append(f"{delta:+.3f}")
+            lines.append(
+                f"{_col(compound, 4)} {_col(cells[0], 9, right=True)} "
+                f"{_col(cells[1], 9, right=True)} {_col(cells[2], 9, right=True)}"
+            )
+
+        return lines, []
 
     def _format_proj_gap(self, gap_seconds, sign, player_info, other_info):
         if gap_seconds is None:
