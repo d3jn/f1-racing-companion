@@ -18,11 +18,19 @@ else:
     _base_dir = os.path.dirname(os.path.abspath(__file__))
 _settings_path = os.path.join(_base_dir, "settings.json")
 
-with open(_settings_path, "r") as _f:
-    _settings = json.load(_f)
-UDP_PORT = _settings["udp_port"]
-BORDERLESS = bool(_settings.get("borderless", False))
-ALWAYS_ON_TOP = bool(_settings.get("always_on_top", False))
+try:
+    with open(_settings_path, "r") as _f:
+        _settings = json.load(_f)
+    if not isinstance(_settings, dict):
+        print("Warning: settings.json is not a JSON object; using built-in defaults",
+              file=sys.stderr)
+        _settings = {}
+except FileNotFoundError:
+    _settings = {}
+except (json.JSONDecodeError, OSError) as _e:
+    print(f"Warning: could not read settings.json ({_e}); using built-in defaults",
+          file=sys.stderr)
+    _settings = {}
 
 
 def _parse_opacity(value):
@@ -33,10 +41,6 @@ def _parse_opacity(value):
     return 1.0
 
 
-OPACITY = _parse_opacity(_settings.get("opacity", 1.0))
-LOG_LAPS = bool(_settings.get("log_laps", False))
-
-
 def _parse_positive_int(value, default):
     if isinstance(value, bool):
         return default
@@ -45,6 +49,11 @@ def _parse_positive_int(value, default):
     return default
 
 
+UDP_PORT = _parse_positive_int(_settings.get("udp_port"), 20777)
+BORDERLESS = bool(_settings.get("borderless", False))
+ALWAYS_ON_TOP = bool(_settings.get("always_on_top", False))
+OPACITY = _parse_opacity(_settings.get("opacity", 1.0))
+LOG_LAPS = bool(_settings.get("log_laps", False))
 PAGE_INNER_WIDTH = _parse_positive_int(_settings.get("width"), 53)
 PAGE_INNER_HEIGHT = _parse_positive_int(_settings.get("height"), 23)
 FONT_SIZE = _parse_positive_int(_settings.get("font_size"), 9)

@@ -20,7 +20,7 @@ If you want to run/build from source then clone the repository and:
 
 ## Configuration
 
-All the settings are read from `settings.json` placed next to `main.py` (or next to the executable, if you built one). The file is required — the app won't start without it. Example:
+All the settings are read from `settings.json` placed next to `main.py` (or next to the executable, if you built one). The file is optional — if it's missing the app starts with built-in defaults; if it exists but isn't valid JSON (or isn't an object), defaults are used too and a warning is printed to stderr. Example:
 
 ```json
 {
