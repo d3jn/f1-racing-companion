@@ -3,6 +3,7 @@
     "borderless": false,
     "always_on_top": false,
     "opacity": 1,
+    "log_laps": false,
     "drivers": [],
     "pitstop_time_lost": {
         "melbourne":         {"pitstop_time": 19, "sc_pitstop_time": 13},

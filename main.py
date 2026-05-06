@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import csv
 
 # F1 25 default UDP port
 UDP_IP = "0.0.0.0"
@@ -33,6 +34,7 @@ def _parse_opacity(value):
 
 
 OPACITY = _parse_opacity(_settings.get("opacity", 1.0))
+LOG_LAPS = bool(_settings.get("log_laps", False))
 
 
 def _normalize_race_number(num):
@@ -230,6 +232,9 @@ def _build_effective_pit_times(user_dict):
 
 _EFFECTIVE_PIT_TIMES = _build_effective_pit_times(_settings.get("pitstop_time_lost"))
 
+# Reverse map: track_id -> slug, used by LapLogger for filenames.
+TRACK_ID_TO_SLUG = {v: k for k, v in TRACK_SLUG_TO_ID.items()}
+
 
 EVENT_CODE_BUTN = b"BUTN"
 UDP_ACTION_1_MASK = 0x00100000
@@ -379,6 +384,7 @@ def parse_car_status(data):
     for i in range(NUM_CARS):
         s = struct.unpack_from(CAR_STATUS_FMT, data, offset)
         statuses[i] = {
+            "fuel_in_tank": s[5],
             "visual_tyre": s[14],
             "tyres_age_laps": s[15],
             "ers_store": s[19],
@@ -706,6 +712,227 @@ class SectorTracker:
         return False
 
 
+class LapLogger:
+    """
+    Writes one CSV row per completed player lap into laps/<...>.csv.
+
+    A new file is opened the first time telemetry produces a usable lap, and
+    again whenever telemetry stalls long enough to be considered "no signal"
+    or the session key (date + track + session group) changes. Files are
+    never appended to from a previous run — the next observation always
+    creates a new file with the smallest unused 4-digit number for that key.
+
+    Pit-stop semantics: the lap-start snapshot is re-taken whenever the
+    visual tyre compound changes mid-lap (pit stop). That keeps the wear
+    delta on out-laps positive (reflecting accumulation on the new tyre)
+    instead of showing a huge negative number from old → new tyre swap.
+
+    All file I/O is wrapped in a lock so the UDP-thread `observe()` can't
+    race with the main-thread `tick()` (stall close) or `close()` (exit).
+    OSErrors are caught — a logging failure can never bring the overlay
+    down; it just disables the logger for the rest of the run.
+    """
+
+    SESSION_GROUP = {
+        1: "practice", 2: "practice", 3: "practice", 4: "practice",
+        5: "qualifying", 6: "qualifying", 7: "qualifying",
+        8: "qualifying", 9: "qualifying",
+        10: "sprint_shootout", 11: "sprint_shootout", 12: "sprint_shootout",
+        13: "sprint_shootout", 14: "sprint_shootout",
+        15: "race", 16: "race", 17: "race",
+        18: "time_trial",
+    }
+    HEADER = [
+        "Lap time", "Lap time in seconds", "Tire compound",
+        "Fuel on start", "Tire wear on start", "Tire wear delta",
+        "Fuel consumption delta", "ERS used",
+    ]
+    MAX_FILE_NUMBER = 9999
+    LATE_JOIN_DISTANCE_M = 500  # if first packet shows further into the lap, skip it
+
+    def __init__(self, base_dir, enabled, stall_threshold_s):
+        self._dir = os.path.join(base_dir, "laps")
+        self._enabled = enabled
+        self._stall_threshold = stall_threshold_s
+        self._lock = threading.Lock()
+        self._file = None
+        self._writer = None
+        self._session_key = None
+        self._lap_start = None
+        self._last_seen = None
+        self._last_lap_num = None
+        self._last_observed_ts = 0.0
+        self._broken = False
+
+    def observe(self, lap_info, status, damage, session_type, track_id, now_ts):
+        if not self._enabled or self._broken:
+            return
+        if not lap_info or not status or not damage:
+            return
+        if session_type not in self.SESSION_GROUP:
+            return
+        if lap_info.get("result_status", 0) not in ACTIVE_STATUS_SET:
+            return
+
+        with self._lock:
+            # Stall detection: close current file if the gap since the last
+            # observation exceeds the stall threshold.
+            if (self._file is not None
+                    and self._last_observed_ts
+                    and (now_ts - self._last_observed_ts) > self._stall_threshold):
+                self._close_locked()
+            self._last_observed_ts = now_ts
+
+            try:
+                max_wear = max(damage["tyre_wear"])
+                fuel = float(status.get("fuel_in_tank", 0.0))
+                compound = TYRE_COMPOUNDS.get(status.get("visual_tyre"), "?")
+                ers_deployed = float(status.get("ers_deployed", 0))
+            except (TypeError, ValueError, KeyError):
+                return
+
+            lap_num = lap_info.get("current_lap_num", 0)
+            last_lap_ms = lap_info.get("last_lap_time_ms", 0)
+            lap_distance = lap_info.get("lap_distance", 0.0)
+
+            track_slug = TRACK_ID_TO_SLUG.get(track_id, "unknown")
+            session_name = self.SESSION_GROUP.get(session_type, "unknown")
+            date_str = time.strftime("%Y_%m_%d")
+            new_key = (date_str, track_slug, session_name)
+
+            # If the session key changes mid-stream (e.g. quali → race), close
+            # the old file so the next write creates a fresh one for the new key.
+            if self._file is not None and new_key != self._session_key:
+                self._close_locked()
+
+            new_snapshot = {"compound": compound, "fuel": fuel, "wear": max_wear}
+
+            if self._last_lap_num is None:
+                # First observation: only trust the snapshot if we caught the
+                # lap near its start. Otherwise leave _lap_start as None and
+                # skip writing until the next true rollover.
+                if lap_distance < self.LATE_JOIN_DISTANCE_M:
+                    self._lap_start = new_snapshot
+            elif lap_num != self._last_lap_num:
+                # Lap rollover. Write the just-completed lap if we have a
+                # valid start snapshot and the rollover is monotonic forward.
+                if (lap_num == self._last_lap_num + 1
+                        and self._lap_start is not None
+                        and last_lap_ms > 0
+                        and self._last_seen is not None):
+                    self._write_lap_locked(
+                        last_lap_ms, self._lap_start, self._last_seen, new_key,
+                    )
+                # Always re-snapshot at rollover so the next lap has clean
+                # start values, even if we skipped writing this one.
+                self._lap_start = new_snapshot
+            else:
+                # Same lap. If the visual compound changed, the player just
+                # pitted — re-snap start so the out-lap delta makes sense.
+                if (self._lap_start is not None
+                        and self._lap_start["compound"] != compound):
+                    self._lap_start = new_snapshot
+
+            self._last_seen = {
+                "fuel": fuel, "wear": max_wear, "ers_deployed": ers_deployed,
+            }
+            self._last_lap_num = lap_num
+
+    def _write_lap_locked(self, last_lap_ms, lap_start, last_seen, key):
+        if self._file is None:
+            self._open_locked(key)
+            if self._file is None:
+                return  # _open_locked failed and set _broken
+
+        seconds_total = last_lap_ms / 1000.0
+        minutes = int(seconds_total // 60)
+        seconds = seconds_total - minutes * 60
+        lap_time_str = f"{minutes:02d}:{seconds:06.3f}"
+
+        wear_delta = last_seen["wear"] - lap_start["wear"]
+        fuel_delta = lap_start["fuel"] - last_seen["fuel"]
+        ers_used_pct = (last_seen["ers_deployed"] / ERS_MAX_ENERGY) * 100
+
+        try:
+            self._writer.writerow([
+                lap_time_str,
+                f"{seconds_total:.3f}",
+                lap_start["compound"],
+                f"{lap_start['fuel']:.3f}",
+                f"{lap_start['wear']:.2f}",
+                f"{wear_delta:.2f}",
+                f"{fuel_delta:.3f}",
+                f"{ers_used_pct:.2f}",
+            ])
+            self._file.flush()
+        except OSError as e:
+            print(f"Warning: lap log write failed: {e}", file=sys.stderr)
+            self._close_locked()
+            self._broken = True
+
+    def _open_locked(self, key):
+        try:
+            os.makedirs(self._dir, exist_ok=True)
+        except OSError as e:
+            print(f"Warning: could not create laps directory: {e}",
+                  file=sys.stderr)
+            self._broken = True
+            return
+
+        date, slug, sess = key
+        n = 1
+        while n <= self.MAX_FILE_NUMBER:
+            path = os.path.join(self._dir, f"{date}_{slug}_{sess}_{n:04d}.csv")
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                self._file = os.fdopen(fd, "w", newline="")
+                self._writer = csv.writer(self._file)
+                self._writer.writerow(self.HEADER)
+                self._file.flush()
+                self._session_key = key
+                return
+            except FileExistsError:
+                n += 1
+            except OSError as e:
+                print(f"Warning: could not open lap log: {e}",
+                      file=sys.stderr)
+                self._broken = True
+                return
+        print(
+            f"Warning: too many lap-log files ({self.MAX_FILE_NUMBER}) for "
+            f"{date}_{slug}_{sess}; skipping",
+            file=sys.stderr,
+        )
+
+    def _close_locked(self):
+        if self._file is not None:
+            try:
+                self._file.close()
+            except OSError:
+                pass
+        self._file = None
+        self._writer = None
+        self._session_key = None
+        self._lap_start = None
+        self._last_seen = None
+        self._last_lap_num = None
+
+    def tick(self, now_ts):
+        """Called from main thread to close the file when telemetry stalls."""
+        if not self._enabled or self._broken:
+            return
+        with self._lock:
+            if (self._file is not None
+                    and self._last_observed_ts
+                    and (now_ts - self._last_observed_ts) > self._stall_threshold):
+                self._close_locked()
+
+    def close(self):
+        """Called on app exit to flush and release the file handle."""
+        with self._lock:
+            self._close_locked()
+
+
 class F1OverlayApp:
 
     def __init__(self):
@@ -718,6 +945,8 @@ class F1OverlayApp:
                 self.root.wm_attributes("-alpha", OPACITY)
         if ALWAYS_ON_TOP:
             self.root.wm_attributes("-topmost", True)
+        # Catch the X button (when not borderless) so we still flush logs.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_exit)
 
         self.lap_summary = {}
         self.car_statuses = {}
@@ -738,6 +967,7 @@ class F1OverlayApp:
 
         self._wear_tracker = WearTracker()
         self._sector_tracker = SectorTracker()
+        self._lap_logger = LapLogger(_base_dir, LOG_LAPS, TELEMETRY_VERY_STALE_S)
 
         # Cross-thread wake-up signal. The actual data lives in instance dicts;
         # the queue is just a coalesced "something changed, please render" flag.
@@ -788,6 +1018,7 @@ class F1OverlayApp:
             self._context_menu.grab_release()
 
     def _on_exit(self):
+        self._lap_logger.close()
         self.root.destroy()
 
     def _udp_loop(self):
@@ -857,6 +1088,16 @@ class F1OverlayApp:
                 status.get("tyres_age_laps", 0),
             )
 
+        # Lap logger only cares about the player car.
+        self._lap_logger.observe(
+            self.lap_summary.get(self.player_car_index),
+            self.car_statuses.get(self.player_car_index),
+            self.car_damages.get(self.player_car_index),
+            self.session_type,
+            self.track_id,
+            time.monotonic(),
+        )
+
     def _handle_event_packet(self, data):
         button_state = parse_event_button_status(data)
         if button_state is None:
@@ -898,6 +1139,8 @@ class F1OverlayApp:
         if had_data or stale_state != self._last_stale_state:
             self._last_stale_state = stale_state
             self._refresh_ui(stale_state)
+
+        self._lap_logger.tick(time.monotonic())
 
         self.root.after(100, self._poll)
 

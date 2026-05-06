@@ -28,6 +28,7 @@ All the settings are read from `settings.json` placed next to `main.py` (or next
     "borderless": false,
     "always_on_top": false,
     "opacity": 1,
+    "log_laps": false,
     "drivers": [
         {
             "name": "DRIVER_NAME",
@@ -55,6 +56,8 @@ All the settings are read from `settings.json` placed next to `main.py` (or next
 - **`always_on_top`** (boolean): When `true`, keeps the overlay window above other windows even when it loses focus. Default is `false`. Leave it off if you're compositing through SteamVR — the host handles z-ordering for you.
 
 - **`opacity`** (number, optional): Whole-window opacity from 0 to 1, applied only when `borderless` is `true`. Affects text as well as background. Default is `1` (fully opaque), `0.5` will be 50% and so on. Values outside `(0, 1]` or non-numeric are ignored and treated as `1`.
+
+- **`log_laps`** (boolean, optional): When `true`, every completed player lap (in/out laps included, incomplete ones skipped) is appended to a CSV under `laps/`. Filenames are `YYYY_MM_DD_<trackslug>_<session>_NNNN.csv` where session is one of `practice`, `qualifying`, `sprint_shootout`, `race`, `time_trial` and `NNNN` is the smallest unused 4-digit number for that key. A new file is created each time telemetry starts (and again if it stalls for more than ~10s, or if the session/track changes mid-stream). Columns are: lap time `MM:SS.mmm`, lap time in seconds, tyre compound (`SOF`/`MED`/`HAR`/`INT`/`WET`), fuel on lap start (kg), tyre wear on lap start (%, worst corner), tyre wear delta over the lap, fuel consumption delta over the lap (positive = burned), and ERS used (% of full pack deployed during the lap). Default is `false`.
 
 - **`drivers`** (array): A list of driver objects with custom names and numbers. This allows you to map custom display names to driver numbers for your league or session.
   - **`name`** (string): The display name for the driver
