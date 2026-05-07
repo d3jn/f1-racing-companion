@@ -4,11 +4,17 @@
 
 # F1 Racing Companion
 
-A real-time Formula 1 telemetry overlay that connects to the F1 25 game via UDP and displays live race information.
+F1 25 telemetry overlay that shows you all the info you will ever need. The goal of the project was to give driver real-time data in a compact and uniformed manner.
+
+I race in VR and I don't like having all those extra overlays or even in-game ones. This one tiny black-box should replace them all and serve you as a silent and trusty race engineer.
 
 ## Overview
 
-This overlay listens to UDP telemetry packets from F1 25 game and displays real-time information such as weather conditions, tire wear with a laps-left projection, ERS level/mode with per-lap battery deltas, standings with deltas relative to the player and other race data (when it's available). It also has a simple pit projection on its own page — the time lost in the pits is configurable per track in `settings.json` if you have your own measurements or want to add some buffer time to account for slower stops, damage repairs etc (default values are my rough estimates so trust them on your own risk). And there's a separate per-compound sector-times page meant for mixed conditions — it shows the fastest S1/S2/S3 across all cars' last 3 laps split by tire compound, so you can see at a glance when slicks have crossed over wets (or the other way around).
+The overlay listens to UDP telemetry packets from F1 25 and displays real-time race information:
+
+- **Live race data** — weather, your tyre wear with a laps-left projection, ERS level/mode with per-lap battery deltas, and standings with deltas relative to your car. Standings also include front-wing damage, penalties, tire compound and wear, so that you know exactly what is going on around you.
+- **Pit projection** — where you come out after a stop and how much of clean air there will be (and how close the next car will be to you) based on the expected pit loss and unserved SG penalties. Per-track pit losses are configurable in `settings.json` if you have your own measurements for your league or want to add a buffer for slower stops, damage repairs and so on (default values are rough estimates so trust them at your own risk).
+- **Sectors & stint pace** — fastest S1/S2/S3 across all cars' last 3 laps split by tire compound (handy in mixed conditions to spot when slicks have crossed over wets, or the other way around), plus a pace-and-wear comparison table for the leader, the car ahead of you, you, and the car behind you.
 
 ## Installation
 
@@ -90,11 +96,35 @@ All the settings are read from `settings.json` placed next to `main.py` (or next
 
 ### What's on each page
 
-- **Page 1** — gap, tyre, wear, battery and ERS mode for the cars directly ahead and behind you, your own tyre wear with a laps-left projection based on the wear delta of your last clean full lap on the current compound (target is 80% because past this value there is a chance of having a puncture; the projection hides until such a lap exists, e.g. on lap 1 of the race or right after a pit), your ERS state with two deltas — `prev` for the battery change across the last completed lap and `now` for the change since the most recent SF crossing (on lap 1 the `now` baseline is the 100% race-start full battery; `prev` only appears once two SF-crossing samples are in the books), and a standings list of ±5 cars around your position.
-- **Page 2** — pit projection (where you'd come out, gap to who'd be ahead/behind you after the stop, expected pit loss, any pending penalties) and the weather forecast samples coming from the game.
-- **Page 3** — best S1/S2/S3 across all cars' last 3 laps broken down by tire compound (SOF, MED, HAR, INT, WET). Cells show an absolute time (e.g. `21.240`) when this compound is the fastest in that sector, otherwise a `+delta` to the column's best (e.g. `+0.250`), or `-` if no clean lap registered on that compound for that sector. Pit-lane segments are excluded — an in-lap doesn't count toward its S3 and an out-lap doesn't count toward its S1, so a slow trundle through pit lane can't sneak in as a sector time. Two extra indicators help spot what's changing:
+#### Page 1 — Live race data
+
+- **Top rows** — gap, tyre, wear, battery, and ERS mode for the cars directly ahead of and behind you.
+- **Player tyre row** — your current worst-corner wear with a laps-left projection. The projection extrapolates from the wear delta of your last clean full lap on the current compound, targeting 80% (past this value there is a chance of a puncture). Hidden until such a lap exists — e.g. on lap 1 of the race or right after a pit.
+- **Player ERS row** — current battery state with two deltas:
+  - `prev` — the battery change across the last completed lap.
+  - `now` — the change since the most recent SF crossing. On lap 1 the baseline is the 100% race-start full battery; `prev` only appears once two SF-crossing samples are in the books.
+- **Standings** — ±5 cars around your position with gap deltas relative to you, lap-down detection, and front-wing damage indicators.
+
+#### Page 2 — Pit projection & weather
+
+- **Pit projection** — where you'd come out after a stop, gap to who'd be ahead of and behind you afterwards, expected pit loss (green flag vs. SC/VSC depending on session state), and any pending penalties (drive-through, stop-go, time penalties, grid drops).
+- **Weather forecast** — the upcoming weather samples from the game (rain probability, weather type, time offset), shown two slots per row to keep the table compact.
+
+#### Page 3 — Sectors & stint pace (race sessions only)
+
+- **Best sectors per compound** — fastest S1/S2/S3 across all cars' last 3 laps broken down by tire compound (SOF, MED, HAR, INT, WET).
+  - Cells show an absolute time (e.g. `21.240`) when this compound is the fastest in that sector, otherwise a `+delta` to the column's best (e.g. `+0.250`), or `-` if no clean lap is registered on that compound for that sector.
+  - Pit-lane segments are excluded — an in-lap doesn't count toward its S3 and an out-lap doesn't count toward its S1, so a slow trundle through pit lane can't sneak in as a sector time.
   - **`[!]` after a cell value** means that time was set on its holder's most recent instance of that sector — i.e., it's still hot. The instant the holder completes that sector again the indicator drops; if the new attempt is faster the cell value updates to it and `[!]` stays on.
   - **`*` after a compound label** marks each sector that compound is currently winning. `SOF***` means softs are fastest everywhere, `INT**` + `MED*` means inters own two sectors and meds the third — so a row gradually growing more stars as the track changes is your crossover signal.
+- **Pace & wear** — a four-row comparison table for the leader, the car ahead of you, you, and the car behind you (rows are de-duplicated when you're on the boundary, e.g. when leading or running last). Each row shows:
+  - **Pos** — current race position.
+  - **Driver** — driver name (your own row is rendered as `------`).
+  - **Cmp** — current tire compound.
+  - **Wear** — current worst-corner wear, plus the average per-lap wear delta from this stint's last 3 clean laps in parens (e.g. `54%(+2.3%)`). The parenthesised delta only appears once at least one clean lap is recorded on the current tyre set.
+  - **AvgLap** — mean lap time across the last 3 clean laps of the current physical tyre set, shown as `MM:SS.mmm`.
+  - **ΔLap** — change between the two most recent 3-lap windows on the current stint, so you can spot graining or pit-window pressure. Only appears once a car has at least 4 clean laps logged on the current tyre set; rendered as `-` otherwise.
+  - In/out laps are excluded so pit traffic doesn't distort the averages. The history wipes whenever the tyre age decreases (a fresh set has been fitted), the compound changes, or the lap counter jumps unexpectedly (e.g. session reset).
 
 ### Window controls
 
