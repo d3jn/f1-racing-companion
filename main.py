@@ -473,18 +473,35 @@ def lap_diff_between(other, player):
     return other.get("current_lap_num", 0) - player.get("current_lap_num", 0)
 
 
+def lap_diff_for_display(other, player, track_length_m):
+    """
+    Integer lap difference between two cars for display purposes.
+
+    Uses cumulative `total_distance` divided by track length so that a `±1L`
+    marker only appears when the cars are physically at least one full lap
+    apart on track. This avoids flashing `±1L` during the brief SF-transition
+    window where lap_nums differ purely due to one car having crossed the
+    line first.
+
+    Falls back to raw `lap_num` diff when `total_distance` or
+    `track_length_m` aren't available (e.g. before the first session packet).
+    """
+    if not other or not player:
+        return 0
+    if track_length_m and track_length_m > 0:
+        other_total = other.get("total_distance")
+        player_total = player.get("total_distance")
+        if other_total is not None and player_total is not None:
+            return int((other_total - player_total) / track_length_m)
+    return lap_diff_between(other, player)
+
+
 def gap_text_between(other, player, track_length_m):
     """Render gap of `other` relative to `player` (signed seconds, or '+/-NL')."""
     if not other or not player:
         return "-"
 
-    lap_diff = lap_diff_between(other, player)
-
-    # SF-line tiebreak: lap nums match but cars are physically a lap apart
-    if lap_diff == 0 and track_length_m and track_length_m > 0:
-        dist_diff = other.get("total_distance", 0.0) - player.get("total_distance", 0.0)
-        if abs(dist_diff) > track_length_m * 0.5:
-            lap_diff = 1 if dist_diff > 0 else -1
+    lap_diff = lap_diff_for_display(other, player, track_length_m)
 
     if lap_diff != 0:
         return f"{lap_diff:+d}L"
@@ -1562,8 +1579,8 @@ class F1OverlayApp:
         behind_gap = (behind_info.get("delta_to_leader", 0.0) - projected_delta_to_leader) if behind_info is not None else None
 
         projected_position_text = f"P{projected_position} ({positions_lost:+d})"
-        ahead_text = self._format_proj_gap(ahead_gap, "+", player, ahead_info) if ahead_info else "-"
-        behind_text = self._format_proj_gap(behind_gap, "-", player, behind_info) if behind_info else "-"
+        ahead_text = self._format_proj_gap(ahead_gap, True, player, ahead_info) if ahead_info else "-"
+        behind_text = self._format_proj_gap(behind_gap, False, player, behind_info) if behind_info else "-"
 
         loss_text = f"loss {pit_loss:.0f}s"
 
@@ -1641,13 +1658,16 @@ class F1OverlayApp:
 
         return lines, []
 
-    def _format_proj_gap(self, gap_seconds, sign, player_info, other_info):
+    def _format_proj_gap(self, gap_seconds, is_ahead, player_info, other_info):
+        """Format a pit-projection gap using page-1's sign convention:
+        ahead car = negative seconds, behind car = positive seconds; lap-down
+        uses the raw lap_diff sign (`+NL` ahead, `-NL` behind)."""
         if gap_seconds is None:
             return "-"
-        lap_diff = lap_diff_between(other_info, player_info)
+        lap_diff = lap_diff_for_display(other_info, player_info, self.track_length_m)
         if lap_diff != 0:
-            return f"{sign}{abs(lap_diff)}L"
-        signed = gap_seconds if sign == "+" else -gap_seconds
+            return f"{lap_diff:+d}L"
+        signed = -gap_seconds if is_ahead else gap_seconds
         return format_signed_seconds(signed)
 
     def _refresh_ui(self, stale_state):
