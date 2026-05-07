@@ -861,16 +861,23 @@ class StintTracker:
     was non-zero) because the lap times distort averages by 20-50s and
     aren't representative of pace.
 
-    Capacity is 6 entries — enough for a 3-vs-3 trend delta on lap times.
+    Once the first BASELINE_WINDOW clean laps are recorded, the stint's
+    "optimal pace" is frozen as the double-trimmed mean of those laps
+    (drop fastest + slowest, average middle 3). The lap-time delta is then
+    `avg(last up-to-3 post-baseline laps) - baseline`, available from the
+    first post-baseline lap onwards (sample size grows from 1 to 3).
     """
 
-    HISTORY = 6
+    BASELINE_WINDOW = 5
 
     def __init__(self):
         # car_idx -> list of {lap_num, lap_time_ms, wear_delta}
         self._stints = {}
         # car_idx -> per-car state
         self._state = {}
+        # car_idx -> frozen optimal-pace baseline in ms, None until
+        # BASELINE_WINDOW clean laps are in. Reset on wipe.
+        self._baseline_ms = {}
 
     def _new_state(self):
         return {
@@ -882,27 +889,31 @@ class StintTracker:
             "clean_start": False,
         }
 
+    def _wipe(self, car_idx, state):
+        self._stints.setdefault(car_idx, []).clear()
+        self._baseline_ms[car_idx] = None
+        state["prev_rollover_wear"] = None
+        state["clean_start"] = False
+
     def observe(self, car_idx, lap_num, last_lap_time_ms, max_wear,
                 pit_status, compound, tyres_age_laps):
         if not lap_num or lap_num <= 0 or compound is None:
             return
 
         state = self._state.setdefault(car_idx, self._new_state())
-        stint = self._stints.setdefault(car_idx, [])
+        self._stints.setdefault(car_idx, [])
+        self._baseline_ms.setdefault(car_idx, None)
+        stint = self._stints[car_idx]
 
         # Fresh tyres fitted (age went backwards) → wipe everything.
         if state["last_age"] is not None and tyres_age_laps < state["last_age"]:
-            stint.clear()
-            state["prev_rollover_wear"] = None
-            state["clean_start"] = False
+            self._wipe(car_idx, state)
         state["last_age"] = tyres_age_laps
 
         # Compound change → wipe.
         if (state["last_compound"] is not None
                 and state["last_compound"] != compound):
-            stint.clear()
-            state["prev_rollover_wear"] = None
-            state["clean_start"] = False
+            self._wipe(car_idx, state)
         state["last_compound"] = compound
 
         # Lap rollover handling.
@@ -921,8 +932,12 @@ class StintTracker:
                             "lap_time_ms": last_lap_time_ms,
                             "wear_delta": wear_delta,
                         })
-                        while len(stint) > self.HISTORY:
-                            stint.pop(0)
+                        # Lock in the optimal-pace baseline once we have N
+                        # clean laps. Computed exactly once per stint;
+                        # later laps don't shift it.
+                        if (len(stint) == self.BASELINE_WINDOW
+                                and self._baseline_ms[car_idx] is None):
+                            self._baseline_ms[car_idx] = self._compute_baseline(stint)
                 # Whether we recorded the lap or not, this rollover IS at
                 # an SF crossing, so the next start is clean and the wear
                 # baseline should advance.
@@ -930,15 +945,19 @@ class StintTracker:
                 state["clean_start"] = True
             else:
                 # Non-monotonic lap-num → wipe.
-                stint.clear()
-                state["prev_rollover_wear"] = None
-                state["clean_start"] = False
+                self._wipe(car_idx, state)
             state["pit_tainted"] = False
         state["last_lap_num"] = lap_num
 
         # Mark current lap pit-tainted if pit_status is non-zero now.
         if pit_status != 0:
             state["pit_tainted"] = True
+
+    @staticmethod
+    def _compute_baseline(first_n_laps):
+        sorted_times = sorted(l["lap_time_ms"] for l in first_n_laps)
+        middle = sorted_times[1:-1]
+        return sum(middle) / len(middle)
 
     def stint_summary(self, car_idx):
         """Returns dict with avg_wear_delta, avg_lap_ms, lap_time_delta_ms,
@@ -951,10 +970,11 @@ class StintTracker:
         avg_lap_ms = sum(l["lap_time_ms"] for l in last_3) / len(last_3)
 
         lap_time_delta_ms = None
-        if len(stint) >= 4:
-            before = stint[-6:-3] if len(stint) >= 6 else stint[:-3]
-            avg_before_ms = sum(l["lap_time_ms"] for l in before) / len(before)
-            lap_time_delta_ms = avg_lap_ms - avg_before_ms
+        baseline_ms = self._baseline_ms.get(car_idx)
+        if baseline_ms is not None and len(stint) > self.BASELINE_WINDOW:
+            post_baseline = stint[self.BASELINE_WINDOW:][-3:]
+            avg_recent_ms = sum(l["lap_time_ms"] for l in post_baseline) / len(post_baseline)
+            lap_time_delta_ms = avg_recent_ms - baseline_ms
 
         return {
             "lap_count": len(stint),
