@@ -845,6 +845,125 @@ class SectorTracker:
         return False
 
 
+class StintTracker:
+    """
+    Per-car running list of clean lap entries on the *current physical tyre
+    set*, used for the page-3 pace-and-wear table.
+
+    Each stored entry holds: lap_num, lap_time_ms, and `wear_delta` =
+    end-of-lap worst-corner wear minus start-of-lap worst-corner wear (so
+    wear *rate*, not level). The entry list is wiped on:
+      - tyre-age decrease (fresh set fitted),
+      - compound change,
+      - lap-num jump > 1 (packet loss / restart).
+
+    Pit in-laps and out-laps are skipped (any lap during which `pit_status`
+    was non-zero) because the lap times distort averages by 20-50s and
+    aren't representative of pace.
+
+    Capacity is 6 entries — enough for a 3-vs-3 trend delta on lap times.
+    """
+
+    HISTORY = 6
+
+    def __init__(self):
+        # car_idx -> list of {lap_num, lap_time_ms, wear_delta}
+        self._stints = {}
+        # car_idx -> per-car state
+        self._state = {}
+
+    def _new_state(self):
+        return {
+            "last_lap_num": None,
+            "last_compound": None,
+            "last_age": None,
+            "pit_tainted": False,
+            "prev_rollover_wear": None,
+            "clean_start": False,
+        }
+
+    def observe(self, car_idx, lap_num, last_lap_time_ms, max_wear,
+                pit_status, compound, tyres_age_laps):
+        if not lap_num or lap_num <= 0 or compound is None:
+            return
+
+        state = self._state.setdefault(car_idx, self._new_state())
+        stint = self._stints.setdefault(car_idx, [])
+
+        # Fresh tyres fitted (age went backwards) → wipe everything.
+        if state["last_age"] is not None and tyres_age_laps < state["last_age"]:
+            stint.clear()
+            state["prev_rollover_wear"] = None
+            state["clean_start"] = False
+        state["last_age"] = tyres_age_laps
+
+        # Compound change → wipe.
+        if (state["last_compound"] is not None
+                and state["last_compound"] != compound):
+            stint.clear()
+            state["prev_rollover_wear"] = None
+            state["clean_start"] = False
+        state["last_compound"] = compound
+
+        # Lap rollover handling.
+        if state["last_lap_num"] is not None and lap_num != state["last_lap_num"]:
+            if lap_num == state["last_lap_num"] + 1:
+                # Append the just-completed lap if it was a clean full lap
+                # AND we have a baseline from the previous SF crossing.
+                if (last_lap_time_ms > 0
+                        and not state["pit_tainted"]
+                        and state["prev_rollover_wear"] is not None
+                        and state["clean_start"]):
+                    wear_delta = max_wear - state["prev_rollover_wear"]
+                    if wear_delta >= 0:
+                        stint.append({
+                            "lap_num": state["last_lap_num"],
+                            "lap_time_ms": last_lap_time_ms,
+                            "wear_delta": wear_delta,
+                        })
+                        while len(stint) > self.HISTORY:
+                            stint.pop(0)
+                # Whether we recorded the lap or not, this rollover IS at
+                # an SF crossing, so the next start is clean and the wear
+                # baseline should advance.
+                state["prev_rollover_wear"] = max_wear
+                state["clean_start"] = True
+            else:
+                # Non-monotonic lap-num → wipe.
+                stint.clear()
+                state["prev_rollover_wear"] = None
+                state["clean_start"] = False
+            state["pit_tainted"] = False
+        state["last_lap_num"] = lap_num
+
+        # Mark current lap pit-tainted if pit_status is non-zero now.
+        if pit_status != 0:
+            state["pit_tainted"] = True
+
+    def stint_summary(self, car_idx):
+        """Returns dict with avg_wear_delta, avg_lap_ms, lap_time_delta_ms,
+        lap_count — or None when the stint is empty."""
+        stint = self._stints.get(car_idx, [])
+        if not stint:
+            return None
+        last_3 = stint[-3:]
+        avg_wear_delta = sum(l["wear_delta"] for l in last_3) / len(last_3)
+        avg_lap_ms = sum(l["lap_time_ms"] for l in last_3) / len(last_3)
+
+        lap_time_delta_ms = None
+        if len(stint) >= 4:
+            before = stint[-6:-3] if len(stint) >= 6 else stint[:-3]
+            avg_before_ms = sum(l["lap_time_ms"] for l in before) / len(before)
+            lap_time_delta_ms = avg_lap_ms - avg_before_ms
+
+        return {
+            "lap_count": len(stint),
+            "avg_wear_delta": avg_wear_delta,
+            "avg_lap_ms": avg_lap_ms,
+            "lap_time_delta_ms": lap_time_delta_ms,
+        }
+
+
 class LapLogger:
     """
     Writes one CSV row per completed player lap into laps/<...>.csv.
@@ -1100,6 +1219,7 @@ class F1OverlayApp:
 
         self._wear_tracker = WearTracker()
         self._sector_tracker = SectorTracker()
+        self._stint_tracker = StintTracker()
         self._ers_tracker = ErsTracker()
         self._lap_logger = LapLogger(_base_dir, LOG_LAPS, TELEMETRY_VERY_STALE_S)
 
@@ -1215,11 +1335,21 @@ class F1OverlayApp:
             if not damage or not status:
                 continue
             max_wear = max(damage["tyre_wear"])
+            compound = TYRE_COMPOUNDS.get(status.get("visual_tyre"))
             self._wear_tracker.observe(
                 car_idx,
                 lap_info.get("current_lap_num", 0),
                 max_wear,
-                TYRE_COMPOUNDS.get(status.get("visual_tyre")),
+                compound,
+                status.get("tyres_age_laps", 0),
+            )
+            self._stint_tracker.observe(
+                car_idx,
+                lap_info.get("current_lap_num", 0),
+                lap_info.get("last_lap_time_ms", 0),
+                max_wear,
+                lap_info.get("pit_status", 0),
+                compound,
                 status.get("tyres_age_laps", 0),
             )
 
@@ -1656,7 +1786,96 @@ class F1OverlayApp:
                 f"{_col(cells[1], 12, right=True)} {_col(cells[2], 12, right=True)}"
             )
 
+        pace_lines = self._build_pace_rows()
+        if pace_lines:
+            lines.append("")
+            lines.extend(pace_lines)
+
         return lines, []
+
+    def _build_pace_rows(self):
+        """Pace & wear table for leader, ahead, player, behind."""
+        player = self.lap_summary.get(self.player_car_index)
+        if not player or player.get("position", 0) <= 0:
+            return []
+
+        player_pos = player["position"]
+        leader_idx = ahead_idx = behind_idx = None
+        for idx, info in self.lap_summary.items():
+            if info.get("result_status", 0) not in ACTIVE_STATUS_SET:
+                continue
+            pos = info.get("position", 0)
+            if pos == 1:
+                leader_idx = idx
+            if pos == player_pos - 1:
+                ahead_idx = idx
+            if pos == player_pos + 1:
+                behind_idx = idx
+
+        ordered = []
+        seen = set()
+        for idx in (leader_idx, ahead_idx, self.player_car_index, behind_idx):
+            if idx is None or idx in seen:
+                continue
+            ordered.append(idx)
+            seen.add(idx)
+
+        if not ordered:
+            return []
+
+        lines = ["Pace & wear (current stint, last 3 laps)"]
+        lines.append(
+            f"{_col('Pos', 3)} {_col('Driver', 10)} {_col('Cmp', 3)} "
+            f"{_col('Wear', 12)} {_col('AvgLap', 9, right=True)} "
+            f"{_col('ΔLap', 7, right=True)}"
+        )
+
+        for idx in ordered:
+            lines.append(self._format_pace_row(idx))
+
+        return lines
+
+    def _format_pace_row(self, car_idx):
+        info = self.lap_summary.get(car_idx, {})
+        pos = info.get("position", 0)
+        is_player = car_idx == self.player_car_index
+        name = "------" if is_player else self._car_display_name(car_idx)
+
+        status = self.car_statuses.get(car_idx)
+        damage = self.car_damages.get(car_idx)
+        compound = (TYRE_COMPOUNDS.get(status.get("visual_tyre"), "?")
+                    if status else "?")
+        current_wear = max(damage["tyre_wear"]) if damage else None
+
+        summary = self._stint_tracker.stint_summary(car_idx)
+
+        if current_wear is None:
+            wear_text = "-"
+        elif summary is not None:
+            wear_text = f"{current_wear:.0f}%({summary['avg_wear_delta']:+.1f}%)"
+        else:
+            wear_text = f"{current_wear:.0f}%"
+
+        if summary is not None:
+            avg_lap_ms = summary["avg_lap_ms"]
+            secs_total = avg_lap_ms / 1000.0
+            minutes = int(secs_total // 60)
+            seconds = secs_total - minutes * 60
+            avg_lap_text = f"{minutes:02d}:{seconds:06.3f}"
+        else:
+            avg_lap_text = "-"
+
+        if summary is not None and summary["lap_time_delta_ms"] is not None:
+            delta_seconds = summary["lap_time_delta_ms"] / 1000.0
+            delta_text = format_signed_seconds(delta_seconds)
+        else:
+            delta_text = "-"
+
+        return (
+            f"{_col(f'P{pos}', 3)} {_col(name, 10)} {_col(compound, 3)} "
+            f"{_col(wear_text, 12)} {_col(avg_lap_text, 9, right=True)} "
+            f"{_col(delta_text, 7, right=True)}"
+        )
 
     def _format_proj_gap(self, gap_seconds, is_ahead, player_info, other_info):
         """Format a pit-projection gap using page-1's sign convention:
