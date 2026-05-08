@@ -55,7 +55,7 @@ ALWAYS_ON_TOP = bool(_settings.get("always_on_top", False))
 OPACITY = _parse_opacity(_settings.get("opacity", 1.0))
 LOG_LAPS = bool(_settings.get("log_laps", False))
 PAGE_INNER_WIDTH = _parse_positive_int(_settings.get("width"), 53)
-PAGE_INNER_HEIGHT = _parse_positive_int(_settings.get("height"), 23)
+PAGE_INNER_HEIGHT = _parse_positive_int(_settings.get("height"), 18)
 FONT_SIZE = _parse_positive_int(_settings.get("font_size"), 9)
 AUTO_SIZE = bool(_settings.get("auto_size", False))
 
@@ -323,13 +323,14 @@ def parse_event_button_status(data):
 
 def parse_session_packet(data):
     pre = struct.unpack_from(PRE_MARSHAL_FMT, data, HEADER_SIZE)
+    total_laps = pre[3]
     track_length_m = pre[4]
     session_type = pre[5]
     track_id = pre[6]
 
     offset = HEADER_SIZE + PRE_MARSHAL_SIZE + MARSHAL_ZONE_SIZE * 21
     if offset + POST_MARSHAL_SIZE > len(data):
-        return [], track_id, 0, track_length_m, session_type
+        return [], track_id, 0, track_length_m, session_type, total_laps
 
     post = struct.unpack_from(POST_MARSHAL_FMT, data, offset)
     safety_car_status = post[0]
@@ -353,7 +354,7 @@ def parse_session_packet(data):
         })
         offset += WEATHER_SAMPLE_SIZE
 
-    return samples, track_id, safety_car_status, track_length_m, session_type
+    return samples, track_id, safety_car_status, track_length_m, session_type, total_laps
 
 
 def parse_lap_positions(data):
@@ -1230,6 +1231,7 @@ class F1OverlayApp:
         self.track_length_m = 0
         self.safety_car_status = 0
         self.session_type = 0
+        self.total_laps = 0
         self.player_car_index = 0
         self.active_page_index = 1
         self._prev_buttons_state = 0
@@ -1324,7 +1326,7 @@ class F1OverlayApp:
                 elif pid == PACKET_SESSION_DATA:
                     (self.weather_samples, self.track_id,
                      self.safety_car_status, self.track_length_m,
-                     self.session_type) = parse_session_packet(data)
+                     self.session_type, self.total_laps) = parse_session_packet(data)
                 else:
                     continue
             except struct.error:
@@ -1572,12 +1574,51 @@ class F1OverlayApp:
                 f"{_col(fw_text, 9, right=True)} {_col(pen_text, 11)}"
             )
 
+        header = (
+            f"{_col('P', 2)} {_col('Driver', 10)} {_col('Gap', 8, right=True)} "
+            f"{_col('Cmp', 3)} {_col('Wear', 4, right=True)} "
+            f"{_col('FW', 9, right=True)} {_col('Pen', 11)}"
+        )
+
         if player_list_idx is None:
-            return all_rows[:11]
+            return [header, *all_rows[:11]]
 
         start = max(0, player_list_idx - 5)
         end = min(len(all_rows), player_list_idx + 6)
-        return all_rows[start:end]
+        return [header, *all_rows[start:end]]
+
+    def _player_race_laps_remaining(self, player):
+        """Laps the player will run before the chequered flag, including the
+        current one. Returns None when the figure can't be computed (no
+        SESSION packet yet, time-based session with total_laps=0, or no
+        leader visible).
+
+        Formula: (total_laps - leader.current_lap_num + 1) - lap_diff_to_leader.
+        That isn't a perfect model of how lapped cars finish in F1 — when the
+        leader takes the chequered, every car gets it on their next SF
+        crossing, so a 2-lap-down driver typically completes ~leader_remaining
+        more laps, not leader_remaining-2. The deduction is intentional: it's
+        a slightly conservative estimate that biases tyre planning toward
+        pitting earlier rather than later.
+        """
+        if not self.total_laps:
+            return None
+
+        leader_info = None
+        for info in self.lap_summary.values():
+            if info.get("position") == 1:
+                leader_info = info
+                break
+        if not leader_info:
+            return None
+
+        leader_lap = leader_info.get("current_lap_num", 0)
+        if leader_lap <= 0:
+            return None
+
+        leader_remaining = self.total_laps - leader_lap + 1
+        lap_deficit = lap_diff_for_display(leader_info, player, self.track_length_m)
+        return max(0, leader_remaining - lap_deficit)
 
     def _build_player_extras(self, player):
         lines = []
@@ -1586,6 +1627,8 @@ class F1OverlayApp:
         status = self.car_statuses.get(self.player_car_index)
         current_compound = (TYRE_COMPOUNDS.get(status.get("visual_tyre"))
                             if status else None)
+
+        race_laps_left = self._player_race_laps_remaining(player)
 
         if damage:
             wear = damage["tyre_wear"]
@@ -1597,10 +1640,14 @@ class F1OverlayApp:
                     and last[0] == current_compound and last[1] > 0):
                 last_delta = last[1]
                 if max_wear >= WEAR_TARGET_PCT:
-                    deg_text = f"+{last_delta:.1f}/lap ~0L left"
+                    tyre_laps = 0
                 else:
-                    laps_left = (WEAR_TARGET_PCT - max_wear) / last_delta
-                    deg_text = f"+{last_delta:.1f}/lap ~{laps_left:.0f}L left"
+                    tyre_laps = int((WEAR_TARGET_PCT - max_wear) / last_delta)
+                if race_laps_left is not None:
+                    laps_text = f"~{tyre_laps}/{race_laps_left}L left"
+                else:
+                    laps_text = f"~{tyre_laps}L left"
+                deg_text = f"+{last_delta:.1f}/lap {laps_text}"
                 lines.append(f"Tyre: {max_wear:.0f}% ({corner}) {deg_text}")
             else:
                 lines.append(f"Tyre: {max_wear:.0f}% ({corner})")
@@ -1676,7 +1723,10 @@ class F1OverlayApp:
         if not player:
             return ["Waiting for telemetry..."], []
 
-        return list(self._build_player_extras(player)), self._build_standings_rows()
+        if self.session_type not in RACE_SESSION_TYPES:
+            return [], self._build_standings_rows()
+
+        return [*self._build_player_extras(player), ""], self._build_standings_rows()
 
     def _render_page_2(self):
         if self._is_player_retired():
@@ -1767,7 +1817,7 @@ class F1OverlayApp:
                 parts.append(f"{unserved_sg}xSG(+{owed_sg}s)")
             top_lines.append(f"Pen owed: {_col(' '.join(parts), 30)} = +{owed_total}s")
 
-        return top_lines, self._build_weather_lines()
+        return [*top_lines, ""], self._build_weather_lines()
 
     def _render_page_3(self):
         if self._is_player_retired():
@@ -1785,11 +1835,10 @@ class F1OverlayApp:
             if existing is None or t < existing[1]:
                 column_best[sector_idx] = (compound, t)
 
-        lines = ["Best sectors per compound (last 3 laps, all cars)"]
-        lines.append(
+        lines = [
             f"{_col('', 6)} {_col('S1', 12, right=True)} "
             f"{_col('S2', 12, right=True)} {_col('S3', 12, right=True)}"
-        )
+        ]
 
         for compound in ("SOF", "MED", "HAR", "INT", "WET"):
             cells = []
@@ -1855,12 +1904,11 @@ class F1OverlayApp:
         if not ordered:
             return []
 
-        lines = ["Pace & wear (current stint, last 3 laps)"]
-        lines.append(
+        lines = [
             f"{_col('Pos', 3)} {_col('Driver', 10)} {_col('Cmp', 3)} "
             f"{_col('Wear', 12)} {_col('AvgLap', 9, right=True)} "
             f"{_col('ΔLap', 7, right=True)}"
-        )
+        ]
 
         for idx in ordered:
             lines.append(self._format_pace_row(idx))
