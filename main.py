@@ -1619,6 +1619,53 @@ class F1OverlayApp:
 
         return lines
 
+    def _build_ahead_behind_rows(self):
+        """Two rows for the cars immediately ahead and behind the player
+        (gap, tyre, wear, battery, ERS mode). Returns [] when not
+        applicable: non-race session, race start, retired, or no player
+        position yet. Rendered as a persistent header above every page."""
+        if self._is_player_retired():
+            return []
+        if self.session_type not in RACE_SESSION_TYPES:
+            return []
+        if self._is_race_start():
+            return []
+
+        player = self.lap_summary.get(self.player_car_index)
+        if not player or player.get("position", 0) <= 0:
+            return []
+
+        player_pos = player["position"]
+        ahead_idx = None
+        behind_idx = None
+        for idx, info in self.lap_summary.items():
+            if info.get("result_status", 0) not in ACTIVE_STATUS_SET:
+                continue
+            pos = info.get("position", 0)
+            if pos == player_pos - 1:
+                ahead_idx = idx
+            if pos == player_pos + 1:
+                behind_idx = idx
+
+        rows = []
+        for other_idx in (ahead_idx, behind_idx):
+            other_lap = self.lap_summary.get(other_idx) if other_idx is not None else None
+            info = (get_car_info(other_idx, self.car_statuses, self.car_damages)
+                    if other_idx is not None else None)
+            if info and other_lap:
+                gap_text = gap_text_between(other_lap, player, self.track_length_m)
+                rows.append(
+                    f"{_col(gap_text, 8, right=True)} {_col(info['tyre'], 3)} "
+                    f"{_col(info['wear'], 9)} {_col(info['battery'], 4)} "
+                    f"{_col(info['ers_mode'], 8)}"
+                )
+            else:
+                rows.append(
+                    f"{_col('-', 8, right=True)} {_col('-', 3)} {_col('-', 9)} "
+                    f"{_col('-', 4)} {_col('-', 8)}"
+                )
+        return rows
+
     def _render_page_1(self):
         if self._is_player_retired():
             return [self._retirement_banner()], self._build_weather_lines()
@@ -1629,42 +1676,7 @@ class F1OverlayApp:
         if not player:
             return ["Waiting for telemetry..."], []
 
-        cars_lines = []
-        if self.session_type in RACE_SESSION_TYPES:
-            player_pos = player.get("position", 0)
-            ahead_idx = None
-            behind_idx = None
-            for idx, info in self.lap_summary.items():
-                if info.get("result_status", 0) not in ACTIVE_STATUS_SET:
-                    continue
-                pos = info.get("position", 0)
-                if pos == player_pos - 1:
-                    ahead_idx = idx
-                if pos == player_pos + 1:
-                    behind_idx = idx
-
-            ahead_lap = self.lap_summary.get(ahead_idx) if ahead_idx is not None else None
-            behind_lap = self.lap_summary.get(behind_idx) if behind_idx is not None else None
-            ahead_info = get_car_info(ahead_idx, self.car_statuses, self.car_damages) if ahead_idx is not None else None
-            behind_info = get_car_info(behind_idx, self.car_statuses, self.car_damages) if behind_idx is not None else None
-
-            for other_lap, info in [(ahead_lap, ahead_info), (behind_lap, behind_info)]:
-                if info and other_lap:
-                    gap_text = gap_text_between(other_lap, player, self.track_length_m)
-                    cars_lines.append(
-                        f"{_col(gap_text, 8, right=True)} {_col(info['tyre'], 3)} "
-                        f"{_col(info['wear'], 9)} {_col(info['battery'], 4)} "
-                        f"{_col(info['ers_mode'], 8)}"
-                    )
-                else:
-                    cars_lines.append(
-                        f"{_col('-', 8, right=True)} {_col('-', 3)} {_col('-', 9)} "
-                        f"{_col('-', 4)} {_col('-', 8)}"
-                    )
-
-        cars_lines.extend(self._build_player_extras(player))
-
-        return cars_lines, self._build_standings_rows()
+        return list(self._build_player_extras(player)), self._build_standings_rows()
 
     def _render_page_2(self):
         if self._is_player_retired():
@@ -1917,13 +1929,27 @@ class F1OverlayApp:
         render_fn = self.page_renderers.get(self.active_page_index, self.page_renderers[1])
         cars_lines, weather_lines = render_fn()
 
-        if stale_state == "stale":
-            cars_lines = ["[STALE]"] + list(cars_lines)
-        elif stale_state == "very_stale":
-            cars_lines = ["[NO SIGNAL]"] + list(cars_lines)
-            weather_lines = []
+        # Persistent ahead/behind header sits above every page's content,
+        # followed by a blank separator. Hidden when not applicable
+        # (non-race session, race start, retired) — see helper for full
+        # gating. Wiped together with weather on very_stale.
+        header_lines = []
+        if stale_state != "very_stale":
+            ah_rows = self._build_ahead_behind_rows()
+            if ah_rows:
+                header_lines = [*ah_rows, ""]
 
-        self.page_var.set(_compose_page([*cars_lines, *weather_lines]))
+        if stale_state == "stale":
+            prefix = ["[STALE]"]
+        elif stale_state == "very_stale":
+            prefix = ["[NO SIGNAL]"]
+            weather_lines = []
+        else:
+            prefix = []
+
+        self.page_var.set(_compose_page(
+            [*prefix, *header_lines, *cars_lines, *weather_lines]
+        ))
 
     def run(self):
         self.root.mainloop()

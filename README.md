@@ -94,11 +94,14 @@ All the settings are read from `settings.json` placed next to `main.py` (or next
 4. Bind **UDP Action 1** and **UDP Action 2** in the game's controls — those are the buttons you'll use to flip between the overlay's pages. They aren't bound to anything by default.
 5. The overlay will start filling in once the game pushes its first session and lap packets.
 
+### Persistent header (all pages)
+
+Two rows showing **gap, tyre, wear, battery, and ERS mode** for the cars directly ahead of and behind you sit above the active page's content on every page, followed by a blank separator. They stay put as you flip between pages so you never lose sight of who you're racing. The header is hidden when the data isn't applicable: non-race sessions, the very start of a race (formation/lap-1 grid view), and after the player retires.
+
 ### What's on each page
 
 #### Page 1 — Live race data
 
-- **Top rows** — gap, tyre, wear, battery, and ERS mode for the cars directly ahead of and behind you.
 - **Player tyre row** — your current worst-corner wear with a laps-left projection. The projection extrapolates from the wear delta of your last clean full lap on the current compound, targeting 80% (past this value there is a chance of a puncture). Hidden until such a lap exists — e.g. on lap 1 of the race or right after a pit.
 - **Player ERS row** — current battery state with two deltas:
   - `prev` — the battery change across the last completed lap.
