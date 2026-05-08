@@ -118,11 +118,11 @@ RACE_SESSION_TYPES = {15, 16, 17}
 
 TEMP_CHANGE = {0: "up", 1: "down", 2: "no change"}
 
-TYRE_COMPOUNDS = {16: "SOF", 17: "MED", 18: "HAR", 7: "INT", 8: "WET"}
+TIRE_COMPOUNDS = {16: "SOF", 17: "MED", 18: "HAR", 7: "INT", 8: "WET"}
 
 ERS_MODES = {0: "None", 1: "Medium", 2: "Hotlap", 3: "Overtake"}
 
-TYRE_NAMES = ["RL", "RR", "FL", "FR"]
+TIRE_NAMES = ["RL", "RR", "FL", "FR"]
 
 ERS_MAX_ENERGY = 4_000_000  # 4 MJ in Joules
 STOP_GO_PENALTY_SECONDS = 10
@@ -142,7 +142,7 @@ TELEMETRY_VERY_STALE_S = 10.0
 # Race-start grid view: player on lap 1 within this distance of the line
 RACE_START_LAP_DISTANCE_M = 800
 
-# Tyre wear projection target — laps-left is computed against this threshold
+# Tire wear projection target — laps-left is computed against this threshold
 WEAR_TARGET_PCT = 80
 
 # Per-track pit-loss baselines (green / safety car), in seconds.
@@ -295,11 +295,11 @@ PARTICIPANT_DATA_SIZE = 57
 CAR_STATUS_FMT = "<BBBBBfffHHBBHBBBbfffBfffB"
 CAR_STATUS_SIZE = struct.calcsize(CAR_STATUS_FMT)  # 55
 
-# CarDamageData per car: 4 tyre-wear floats + 30 uint8 damage values.
+# CarDamageData per car: 4 tire-wear floats + 30 uint8 damage values.
 # Indices in the unpacked tuple (after the 4 floats):
-#   4-7   tyresDamage[4]
+#   4-7   tiresDamage[4]
 #   8-11  brakesDamage[4]
-#   12-15 tyresBlistered[4]
+#   12-15 tiresBlistered[4]
 #   16    frontLeftWingDamage
 #   17    frontRightWingDamage
 #   18    rearWingDamage
@@ -407,8 +407,8 @@ def parse_car_status(data):
         s = struct.unpack_from(CAR_STATUS_FMT, data, offset)
         statuses[i] = {
             "fuel_in_tank": s[5],
-            "visual_tyre": s[14],
-            "tyres_age_laps": s[15],
+            "visual_tire": s[14],
+            "tires_age_laps": s[15],
             "ers_store": s[19],
             "ers_mode": s[20],
             "ers_harvested_mguk": s[21],
@@ -425,7 +425,7 @@ def parse_car_damage(data):
     for i in range(NUM_CARS):
         d = struct.unpack_from(CAR_DAMAGE_FMT, data, offset)
         damages[i] = {
-            "tyre_wear": [d[0], d[1], d[2], d[3]],
+            "tire_wear": [d[0], d[1], d[2], d[3]],
             "fw_left": d[16],
             "fw_right": d[17],
         }
@@ -516,16 +516,16 @@ def get_compound_and_max_wear(car_idx, car_statuses, car_damages):
     status = car_statuses.get(car_idx)
     damage = car_damages.get(car_idx)
 
-    tyre = "?"
+    tire = "?"
     if status:
-        tyre = TYRE_COMPOUNDS.get(status["visual_tyre"], "?")
+        tire = TIRE_COMPOUNDS.get(status["visual_tire"], "?")
 
     wear_text = "-"
     if damage:
-        max_wear = max(damage["tyre_wear"])
+        max_wear = max(damage["tire_wear"])
         wear_text = f"{max_wear:.0f}%"
 
-    return tyre, wear_text
+    return tire, wear_text
 
 
 def format_fw_text(damage):
@@ -547,24 +547,24 @@ def get_car_info(car_idx, car_statuses, car_damages):
     if not status or not damage:
         return None
 
-    tyre = TYRE_COMPOUNDS.get(status["visual_tyre"], "?")
+    tire = TIRE_COMPOUNDS.get(status["visual_tire"], "?")
 
-    wear = damage["tyre_wear"]
+    wear = damage["tire_wear"]
     max_wear = max(wear)
     max_idx = wear.index(max_wear)
-    wear_str = f"{max_wear:.0f}% ({TYRE_NAMES[max_idx]})"
+    wear_str = f"{max_wear:.0f}% ({TIRE_NAMES[max_idx]})"
 
     battery_pct = (status["ers_store"] / ERS_MAX_ENERGY) * 100
     battery_str = f"{battery_pct:.0f}%"
 
     ers_mode = ERS_MODES.get(status["ers_mode"], "?")
 
-    return {"tyre": tyre, "wear": wear_str, "battery": battery_str, "ers_mode": ers_mode}
+    return {"tire": tire, "wear": wear_str, "battery": battery_str, "ers_mode": ers_mode}
 
 
 class WearTracker:
     """
-    Tracks each car's most recent *clean full lap* of tyre-wear delta on the
+    Tracks each car's most recent *clean full lap* of tire-wear delta on the
     current compound. A clean full lap is one that ran from one SF crossing
     to the next without an intervening compound change and with the start
     snapshot taken at a true SF crossing (not at a mid-stream join or pit).
@@ -579,21 +579,21 @@ class WearTracker:
         # clean_start: True if `wear` was sampled at an SF crossing.
         self._lap_start = {}
         # car_idx -> (compound, lap_wear_delta) from the most recent clean
-        # full lap. Cleared on compound change, lap-num jump, fresh tyres,
+        # full lap. Cleared on compound change, lap-num jump, fresh tires,
         # and any non-clean rollover.
         self._last_lap_wear = {}
         self._last_age = {}
 
-    def observe(self, car_idx, lap_num, max_wear, compound, tyres_age_laps):
+    def observe(self, car_idx, lap_num, max_wear, compound, tires_age_laps):
         if lap_num <= 0 or compound is None:
             return
 
-        # Fresh tyres detected (age went backwards) — wipe state.
+        # Fresh tires detected (age went backward) — wipe state.
         prev_age = self._last_age.get(car_idx)
-        if prev_age is not None and tyres_age_laps < prev_age:
+        if prev_age is not None and tires_age_laps < prev_age:
             self._lap_start.pop(car_idx, None)
             self._last_lap_wear.pop(car_idx, None)
-        self._last_age[car_idx] = tyres_age_laps
+        self._last_age[car_idx] = tires_age_laps
 
         prev = self._lap_start.get(car_idx)
 
@@ -746,7 +746,7 @@ class SectorTracker:
         last_lap_ms = lap_info.get("last_lap_time_ms", 0)
         s1_total_ms = lap_info.get("sector1_total_ms", 0)
         s2_total_ms = lap_info.get("sector2_total_ms", 0)
-        compound = TYRE_COMPOUNDS.get(status.get("visual_tyre")) if status else None
+        compound = TIRE_COMPOUNDS.get(status.get("visual_tire")) if status else None
 
         state = self._car_state.setdefault(car_idx, {"last_lap": None})
         laps = self._car_laps.setdefault(car_idx, {})
@@ -848,13 +848,13 @@ class SectorTracker:
 
 class StintTracker:
     """
-    Per-car running list of clean lap entries on the *current physical tyre
+    Per-car running list of clean lap entries on the *current physical tire
     set*, used for the page-3 pace-and-wear table.
 
     Each stored entry holds: lap_num, lap_time_ms, and `wear_delta` =
     end-of-lap worst-corner wear minus start-of-lap worst-corner wear (so
     wear *rate*, not level). The entry list is wiped on:
-      - tyre-age decrease (fresh set fitted),
+      - tire-age decrease (fresh set fitted),
       - compound change,
       - lap-num jump > 1 (packet loss / restart).
 
@@ -897,7 +897,7 @@ class StintTracker:
         state["clean_start"] = False
 
     def observe(self, car_idx, lap_num, last_lap_time_ms, max_wear,
-                pit_status, compound, tyres_age_laps):
+                pit_status, compound, tires_age_laps):
         if not lap_num or lap_num <= 0 or compound is None:
             return
 
@@ -906,10 +906,10 @@ class StintTracker:
         self._baseline_ms.setdefault(car_idx, None)
         stint = self._stints[car_idx]
 
-        # Fresh tyres fitted (age went backwards) → wipe everything.
-        if state["last_age"] is not None and tyres_age_laps < state["last_age"]:
+        # Fresh tires fitted (age went backward) → wipe everything.
+        if state["last_age"] is not None and tires_age_laps < state["last_age"]:
             self._wipe(car_idx, state)
-        state["last_age"] = tyres_age_laps
+        state["last_age"] = tires_age_laps
 
         # Compound change → wipe.
         if (state["last_compound"] is not None
@@ -996,9 +996,9 @@ class LapLogger:
     creates a new file with the smallest unused 4-digit number for that key.
 
     Pit-stop semantics: the lap-start snapshot is re-taken whenever the
-    visual tyre compound changes mid-lap (pit stop). That keeps the wear
-    delta on out-laps positive (reflecting accumulation on the new tyre)
-    instead of showing a huge negative number from old → new tyre swap.
+    visual tire compound changes mid-lap (pit stop). That keeps the wear
+    delta on out-laps positive (reflecting accumulation on the new tire)
+    instead of showing a huge negative number from old → new tire swap.
 
     All file I/O is wrapped in a lock so the UDP-thread `observe()` can't
     race with the main-thread `tick()` (stall close) or `close()` (exit).
@@ -1057,9 +1057,9 @@ class LapLogger:
             self._last_observed_ts = now_ts
 
             try:
-                max_wear = max(damage["tyre_wear"])
+                max_wear = max(damage["tire_wear"])
                 fuel = float(status.get("fuel_in_tank", 0.0))
-                compound = TYRE_COMPOUNDS.get(status.get("visual_tyre"), "?")
+                compound = TIRE_COMPOUNDS.get(status.get("visual_tire"), "?")
                 ers_deployed = float(status.get("ers_deployed", 0))
             except (TypeError, ValueError, KeyError):
                 return
@@ -1356,14 +1356,14 @@ class F1OverlayApp:
             damage = self.car_damages.get(car_idx)
             if not damage or not status:
                 continue
-            max_wear = max(damage["tyre_wear"])
-            compound = TYRE_COMPOUNDS.get(status.get("visual_tyre"))
+            max_wear = max(damage["tire_wear"])
+            compound = TIRE_COMPOUNDS.get(status.get("visual_tire"))
             self._wear_tracker.observe(
                 car_idx,
                 lap_info.get("current_lap_num", 0),
                 max_wear,
                 compound,
-                status.get("tyres_age_laps", 0),
+                status.get("tires_age_laps", 0),
             )
             self._stint_tracker.observe(
                 car_idx,
@@ -1372,7 +1372,7 @@ class F1OverlayApp:
                 max_wear,
                 lap_info.get("pit_status", 0),
                 compound,
-                status.get("tyres_age_laps", 0),
+                status.get("tires_age_laps", 0),
             )
 
         # ERS tracker — player only.
@@ -1513,8 +1513,8 @@ class F1OverlayApp:
             if is_player:
                 player_list_idx = list_idx
             name = "------" if is_player else self._car_display_name(idx)
-            tyre, _wear = get_compound_and_max_wear(idx, self.car_statuses, self.car_damages)
-            rows.append(f"{_col(pos, 2)} {_col(name, 12)} {_col(tyre, 3)}")
+            tire, _wear = get_compound_and_max_wear(idx, self.car_statuses, self.car_damages)
+            rows.append(f"{_col(pos, 2)} {_col(name, 12)} {_col(tire, 3)}")
 
         if player_list_idx is None:
             window = rows[:11]
@@ -1555,7 +1555,7 @@ class F1OverlayApp:
             else:
                 gap_text = gap_text_between(info, player, self.track_length_m)
 
-            tyre, wear = get_compound_and_max_wear(idx, self.car_statuses, self.car_damages)
+            tire, wear = get_compound_and_max_wear(idx, self.car_statuses, self.car_damages)
             fw_text = format_fw_text(self.car_damages.get(idx))
 
             pen_parts = []
@@ -1570,7 +1570,7 @@ class F1OverlayApp:
 
             all_rows.append(
                 f"{_col(pos, 2)} {_col(name, 10)} {_col(gap_text, 8, right=True)} "
-                f"{_col(tyre, 3)} {_col(wear, 4, right=True)} "
+                f"{_col(tire, 3)} {_col(wear, 4, right=True)} "
                 f"{_col(fw_text, 9, right=True)} {_col(pen_text, 11)}"
             )
 
@@ -1598,7 +1598,7 @@ class F1OverlayApp:
         leader takes the chequered, every car gets it on their next SF
         crossing, so a 2-lap-down driver typically completes ~leader_remaining
         more laps, not leader_remaining-2. The deduction is intentional: it's
-        a slightly conservative estimate that biases tyre planning toward
+        a slightly conservative estimate that biases tire planning toward
         pitting earlier rather than later.
         """
         if not self.total_laps:
@@ -1625,32 +1625,32 @@ class F1OverlayApp:
 
         damage = self.car_damages.get(self.player_car_index)
         status = self.car_statuses.get(self.player_car_index)
-        current_compound = (TYRE_COMPOUNDS.get(status.get("visual_tyre"))
+        current_compound = (TIRE_COMPOUNDS.get(status.get("visual_tire"))
                             if status else None)
 
         race_laps_left = self._player_race_laps_remaining(player)
 
         if damage:
-            wear = damage["tyre_wear"]
+            wear = damage["tire_wear"]
             max_wear = max(wear)
-            corner = TYRE_NAMES[wear.index(max_wear)]
+            corner = TIRE_NAMES[wear.index(max_wear)]
             last = self._wear_tracker.last_lap_wear(self.player_car_index)
 
             if (last is not None and current_compound is not None
                     and last[0] == current_compound and last[1] > 0):
                 last_delta = last[1]
                 if max_wear >= WEAR_TARGET_PCT:
-                    tyre_laps = 0
+                    tire_laps = 0
                 else:
-                    tyre_laps = int((WEAR_TARGET_PCT - max_wear) / last_delta)
+                    tire_laps = int((WEAR_TARGET_PCT - max_wear) / last_delta)
                 if race_laps_left is not None:
-                    laps_text = f"~{tyre_laps}/{race_laps_left}L left"
+                    laps_text = f"~{tire_laps}/{race_laps_left}L left"
                 else:
-                    laps_text = f"~{tyre_laps}L left"
+                    laps_text = f"~{tire_laps}L left"
                 deg_text = f"+{last_delta:.1f}/lap {laps_text}"
-                lines.append(f"Tyre: {max_wear:.0f}% ({corner}) {deg_text}")
+                lines.append(f"Tire: {max_wear:.0f}% ({corner}) {deg_text}")
             else:
-                lines.append(f"Tyre: {max_wear:.0f}% ({corner})")
+                lines.append(f"Tire: {max_wear:.0f}% ({corner})")
 
         if status:
             store_pct = (status.get("ers_store", 0) / ERS_MAX_ENERGY) * 100
@@ -1668,7 +1668,7 @@ class F1OverlayApp:
 
     def _build_ahead_behind_rows(self):
         """Two rows for the cars immediately ahead and behind the player
-        (gap, tyre, wear, battery, ERS mode). Returns [] when not
+        (gap, tire, wear, battery, ERS mode). Returns [] when not
         applicable: non-race session, race start, retired, or no player
         position yet. Rendered as a persistent header above every page."""
         if self._is_player_retired():
@@ -1702,7 +1702,7 @@ class F1OverlayApp:
             if info and other_lap:
                 gap_text = gap_text_between(other_lap, player, self.track_length_m)
                 rows.append(
-                    f"{_col(gap_text, 8, right=True)} {_col(info['tyre'], 3)} "
+                    f"{_col(gap_text, 8, right=True)} {_col(info['tire'], 3)} "
                     f"{_col(info['wear'], 9)} {_col(info['battery'], 4)} "
                     f"{_col(info['ers_mode'], 8)}"
                 )
@@ -1923,9 +1923,9 @@ class F1OverlayApp:
 
         status = self.car_statuses.get(car_idx)
         damage = self.car_damages.get(car_idx)
-        compound = (TYRE_COMPOUNDS.get(status.get("visual_tyre"), "?")
+        compound = (TIRE_COMPOUNDS.get(status.get("visual_tire"), "?")
                     if status else "?")
-        current_wear = max(damage["tyre_wear"]) if damage else None
+        current_wear = max(damage["tire_wear"]) if damage else None
 
         summary = self._stint_tracker.stint_summary(car_idx)
 
