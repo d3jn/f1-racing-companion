@@ -1016,7 +1016,7 @@ class LapLogger:
         18: "time_trial",
     }
     HEADER = [
-        "Lap time", "Lap time in seconds", "Tire compound",
+        "Lap number", "Lap time", "Lap time in seconds", "Tire compound",
         "Fuel on start", "Tire wear on start", "Tire wear delta",
         "Fuel consumption delta", "ERS used",
     ]
@@ -1095,7 +1095,8 @@ class LapLogger:
                         and last_lap_ms > 0
                         and self._last_seen is not None):
                     self._write_lap_locked(
-                        last_lap_ms, self._lap_start, self._last_seen, new_key,
+                        self._last_lap_num, last_lap_ms,
+                        self._lap_start, self._last_seen, new_key,
                     )
                 # Re-snapshot at rollover so the next lap has clean start
                 # values, even if we skipped writing this one.
@@ -1119,7 +1120,7 @@ class LapLogger:
             }
             self._last_lap_num = lap_num
 
-    def _write_lap_locked(self, last_lap_ms, lap_start, last_seen, key):
+    def _write_lap_locked(self, lap_number, last_lap_ms, lap_start, last_seen, key):
         if self._file is None:
             self._open_locked(key)
             if self._file is None:
@@ -1136,6 +1137,7 @@ class LapLogger:
 
         try:
             self._writer.writerow([
+                lap_number,
                 lap_time_str,
                 f"{seconds_total:.3f}",
                 lap_start["compound"],
