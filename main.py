@@ -1086,9 +1086,10 @@ class LapLogger:
                 # skip writing until the next true rollover.
                 if lap_distance < self.LATE_JOIN_DISTANCE_M:
                     self._lap_start = new_snapshot
-            elif lap_num != self._last_lap_num:
-                # Lap rollover. Write the just-completed lap if we have a
-                # valid start snapshot and the rollover is monotonic forward.
+            elif lap_num > self._last_lap_num:
+                # Forward lap rollover. Write the just-completed lap if we
+                # have a valid start snapshot and the rollover is by exactly
+                # one lap.
                 if (lap_num == self._last_lap_num + 1
                         and self._lap_start is not None
                         and last_lap_ms > 0
@@ -1096,9 +1097,16 @@ class LapLogger:
                     self._write_lap_locked(
                         last_lap_ms, self._lap_start, self._last_seen, new_key,
                     )
-                # Always re-snapshot at rollover so the next lap has clean
-                # start values, even if we skipped writing this one.
+                # Re-snapshot at rollover so the next lap has clean start
+                # values, even if we skipped writing this one.
                 self._lap_start = new_snapshot
+            elif lap_num < self._last_lap_num:
+                # Flashback across the start/finish line. Current state is
+                # mid-lap, so snapshotting now would under-count the next
+                # lap's wear/fuel deltas. Taint instead — the next forward
+                # rollover will see _lap_start is None, skip its write, and
+                # snapshot cleanly for the lap after that.
+                self._lap_start = None
             else:
                 # Same lap. If the visual compound changed, the player just
                 # pitted — re-snap start so the out-lap delta makes sense.
