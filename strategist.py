@@ -23,12 +23,16 @@ Known limitations:
 
 import argparse
 import csv
+import itertools
 import statistics
 import sys
 
 WEAR_CEILING = 80.0           # percent; running past this is prohibited
-GAP_DETECTION_MULTIPLIER = 1.5  # gap > 1.5 × local wear/lap → real gap
+MERGE_THRESHOLD = 0.5         # gap < 0.5 × local wear/lap → merge as same-age laps
+GAP_DETECTION_MULTIPLIER = 1.5  # gap > 1.5 × local wear/lap → real gap to fill
 EXTRAPOLATION_WINDOW = 5      # head/tail laps used to fit extrapolation regressions
+MAX_EXTRA_PITS = 2            # custom-schedule mode: add at most this many pits
+                              # beyond the user-required ones when searching
 
 COMPOUND_FLAGS = {"soft": "SOF", "medium": "MED", "hard": "HAR"}
 
@@ -58,6 +62,65 @@ def prompt_positive_int(prompt):
             print("  Please enter a positive integer.")
             continue
         return n
+
+
+def parse_pit_laps(raw, total_laps):
+    """Parse comma-separated pit lap numbers. Returns sorted unique list of
+    valid lap indices (each in 1..total_laps-1), or None on any error or
+    duplicates that collapse to fewer stints than the user asked for."""
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return None
+    try:
+        laps = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if any(l < 1 or l >= total_laps for l in laps):
+        return None
+    return sorted(set(laps))
+
+
+def prompt_pit_laps(total_laps):
+    """Return a sorted unique list of pit laps, or None if the user signaled
+    end-of-input (Ctrl-D / Ctrl-C)."""
+    while True:
+        try:
+            raw = input("Pit laps (comma-separated, blank line / Ctrl-D to exit): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not raw:
+            return None
+        laps = parse_pit_laps(raw, total_laps)
+        if laps is None:
+            print(f"  Enter one or more comma-separated lap numbers in 1..{total_laps - 1}.")
+            continue
+        return laps
+
+
+def stint_lengths_from_pit_laps(pit_laps, total_laps):
+    """Given sorted unique pit laps, return the resulting stint lengths."""
+    lengths = []
+    prev = 0
+    for pit in pit_laps:
+        lengths.append(pit - prev)
+        prev = pit
+    lengths.append(total_laps - prev)
+    return lengths
+
+
+def pit_laps_label(required_pits, actual_pits):
+    """Build a heading line describing the chosen schedule. Notes which
+    pit laps the user required vs which the search added."""
+    actual_str = ", ".join(str(l) for l in actual_pits)
+    lap_word = "lap" if len(actual_pits) == 1 else "laps"
+    pit_word = "pit" if len(actual_pits) == 1 else "pits"
+    base = f"Optimal strategy for {pit_word} on {lap_word} {actual_str}"
+    extras = [l for l in actual_pits if l not in required_pits]
+    if extras:
+        ex_lap_word = "lap" if len(extras) == 1 else "laps"
+        ex_str = ", ".join(str(l) for l in extras)
+        base += f" (added {ex_lap_word} {ex_str})"
+    return base
 
 
 def read_compound_rows(path, target_compound):
@@ -98,16 +161,79 @@ def linear_fit(xs, ys):
     return slope, mean_y - slope * mean_x
 
 
+def _cluster_median(cluster):
+    """Median of each field across all members of a cluster."""
+    return {
+        "lap_time":      statistics.median(r["lap_time"]      for r in cluster),
+        "wear_delta":    statistics.median(r["wear_delta"]    for r in cluster),
+        "fuel_delta":    statistics.median(r["fuel_delta"]    for r in cluster),
+        "wear_on_start": statistics.median(r["wear_on_start"] for r in cluster),
+    }
+
+
+def _safe_local_wpl(window_clusters, fallback):
+    """Median wear_delta across a list of clusters, with a non-positive guard."""
+    if not window_clusters:
+        return fallback
+    wpl = statistics.median(_cluster_median(c)["wear_delta"] for c in window_clusters)
+    return wpl if wpl > 0 else fallback
+
+
+def _merge_overlapping(sorted_rows, fallback_wpl):
+    """Iteratively merge adjacent observations that came from different stints
+    but sampled the same tire age.
+
+    Two same-lap-number observations have wear_on_start values that differ by
+    much less than one normal lap's wear progression; two *consecutive*
+    observations differ by ~1 × wear-per-lap. So the criterion is on the raw
+    wear_on_start gap (not the post-progression gap used for fill detection):
+    if |prev_median.wear_on_start − curr_median.wear_on_start| < 0.5 × local
+    wear/lap, the two clusters are the same tire age and get merged.
+
+    Cluster values are the median of all member rows (so merging cascades
+    naturally to 3+ near-identical laps).
+
+    Returns a list of dicts (one per cluster), sorted by wear_on_start.
+    """
+    clusters = [[r] for r in sorted_rows]
+    while True:
+        merged_any = False
+        out = [clusters[0]]
+        for i in range(1, len(clusters)):
+            prev = out[-1]
+            curr = clusters[i]
+            prev_med = _cluster_median(prev)
+            curr_med = _cluster_median(curr)
+            wear_diff = curr_med["wear_on_start"] - prev_med["wear_on_start"]
+            window = out[max(0, len(out) - 3):] + clusters[i:i + 3]
+            local_wpl = _safe_local_wpl(window, fallback_wpl)
+            if wear_diff < MERGE_THRESHOLD * local_wpl:
+                out[-1] = prev + curr
+                merged_any = True
+            else:
+                out.append(curr)
+        clusters = out
+        if not merged_any:
+            break
+        # A merged cluster's median wear_on_start could in principle shift
+        # past a neighbor's; re-sort defensively before the next pass.
+        clusters.sort(key=lambda c: _cluster_median(c)["wear_on_start"])
+
+    return [_cluster_median(c) for c in clusters]
+
+
 def build_sequence(rows):
     """Build the wear-indexed lap sequence for one compound.
 
     Steps:
       1) Sort observations by Tire wear on start.
-      2) Walk consecutive pairs; where the wear gap exceeds 1.5 × the local
-         wear/lap, insert linearly-interpolated synthetic laps.
-      3) Back-extrapolate to 0 % wear using a regression over the first 5
-         entries (the regression covers lap_time, wear_delta, fuel_delta).
-      4) Forward-extrapolate to 80 % wear with the same kind of regression
+      2) Merge near-duplicate observations (different stints sampling the
+         same tire-age range) into median-valued clusters.
+      3) Walk consecutive (merged) pairs; where the wear gap exceeds 1.5 ×
+         the local wear/lap, insert linearly-interpolated synthetic laps.
+      4) Back-extrapolate to 0 % wear using a regression over the first 5
+         entries (lap_time, wear_delta, fuel_delta each vs sequence pos).
+      5) Forward-extrapolate to 80 % wear with the same kind of regression
          over the last 5 entries.
 
     Returns a list of dicts (one per lap, indexed chronologically from 0%
@@ -121,14 +247,16 @@ def build_sequence(rows):
     if global_median_wear <= 0:
         global_median_wear = 1.0  # safety: keep arithmetic well-defined
 
-    sequence = [dict(sorted_rows[0])]
-    for i in range(len(sorted_rows) - 1):
-        a = sorted_rows[i]
-        b = sorted_rows[i + 1]
+    merged = _merge_overlapping(sorted_rows, global_median_wear)
+
+    sequence = [dict(merged[0])]
+    for i in range(len(merged) - 1):
+        a = merged[i]
+        b = merged[i + 1]
         gap = b["wear_on_start"] - (a["wear_on_start"] + a["wear_delta"])
-        local_window = sorted_rows[max(0, i - 2):i + 1] + sorted_rows[i + 1:i + 4]
-        if local_window:
-            local_wpl = statistics.median(r["wear_delta"] for r in local_window)
+        window = merged[max(0, i - 2):i + 1] + merged[i + 1:i + 4]
+        if window:
+            local_wpl = statistics.median(r["wear_delta"] for r in window)
         else:
             local_wpl = global_median_wear
         if local_wpl <= 0:
@@ -236,6 +364,62 @@ def search_one_stop(sequences, total_laps, pit_loss):
     return best
 
 
+def search_fixed_stops(sequences, stint_lengths, pit_loss):
+    """Given fixed stint lengths (derived from a complete pit-lap set),
+    enumerate all compound assignments and return the fastest legal one.
+    Must include ≥2 distinct compounds and respect each compound's
+    max_laps. Returns None if no legal assignment exists."""
+    num_stints = len(stint_lengths)
+    compounds = list(sequences.keys())
+    # Cheap early reject: if any stint length exceeds every compound's
+    # max_laps, no assignment is legal.
+    max_overall = max(len(sequences[c]) for c in compounds)
+    if any(l > max_overall for l in stint_lengths):
+        return None
+    best = None
+    for combo in itertools.product(compounds, repeat=num_stints):
+        if len(set(combo)) < 2:
+            continue
+        if any(stint_lengths[i] > len(sequences[combo[i]])
+               for i in range(num_stints)):
+            continue
+        total = sum(stint_time(sequences[c], l)
+                    for c, l in zip(combo, stint_lengths))
+        total += pit_loss * (num_stints - 1)
+        if best is None or total < best["total"]:
+            best = {
+                "stints": list(zip(combo, stint_lengths)),
+                "total": total,
+                "fuel": sum(stint_fuel(sequences[c], l)
+                            for c, l in zip(combo, stint_lengths)),
+            }
+    return best
+
+
+def search_required_pits(sequences, required_pits, total_laps, pit_loss):
+    """Required pit laps must appear as stint-ends. Search every pit-lap
+    superset that adds 0..MAX_EXTRA_PITS additional pits at non-required
+    positions, and return the fastest legal plan across all of them.
+
+    Returns the best plan dict (augmented with a "pit_laps" key listing
+    the chosen schedule), or None if nothing legal exists."""
+    required = sorted(set(required_pits))
+    candidates = [l for l in range(1, total_laps) if l not in required]
+    best = None
+    for extra_count in range(MAX_EXTRA_PITS + 1):
+        for extra in itertools.combinations(candidates, extra_count):
+            all_pits = sorted(set(required) | set(extra))
+            stint_lengths = stint_lengths_from_pit_laps(all_pits, total_laps)
+            plan = search_fixed_stops(sequences, stint_lengths, pit_loss)
+            if plan is None:
+                continue
+            if best is None or plan["total"] < best["total"]:
+                plan = dict(plan)
+                plan["pit_laps"] = all_pits
+                best = plan
+    return best
+
+
 def search_two_stop(sequences, total_laps, pit_loss):
     """≥2 distinct compounds across the three stints. Returns the fastest
     legal 2-stop plan or None."""
@@ -334,7 +518,24 @@ def main():
     print(format_plan("1-stop strategy", one_stop))
     print()
     print(format_plan("2-stop strategy", two_stop))
-    return 0
+    print()
+
+    while True:
+        pit_laps = prompt_pit_laps(total_laps)
+        if pit_laps is None:
+            print()
+            return 0
+        print()
+        plan = search_required_pits(sequences, pit_laps, total_laps, pit_loss)
+        if plan is None:
+            req_str = ", ".join(str(l) for l in pit_laps)
+            lap_word = "lap" if len(pit_laps) == 1 else "laps"
+            print(f"No legal strategy found for required pit on {lap_word} {req_str} "
+                  f"(every compound choice exceeds 80% tire wear).")
+        else:
+            label = pit_laps_label(pit_laps, plan["pit_laps"])
+            print(format_plan(label, plan))
+        print()
 
 
 if __name__ == "__main__":

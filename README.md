@@ -24,6 +24,8 @@ If you want to run/build from source then clone the repository and:
 * run: `main.py` directly with Python;
 * build: `pyinstaller --onefile --noconsole --icon=assets/icon.ico main.py` and take the resulting standalone executable from `/dist` directory.
 
+The repository also ships with `strategist.py`, an offline race-strategy calculator that consumes the CSV files produced by `log_laps`. It depends only on the Python standard library, so no separate install or build step is needed — just run `python strategist.py ...` from a clone. See the [Race-strategy tool](#race-strategy-tool-strategistpy) section below.
+
 ## Configuration
 
 All the settings are read from `settings.json` placed next to `main.py` (or next to the executable, if you built one). The file is optional — if it's missing the app starts with built-in defaults; if it exists but isn't valid JSON (or isn't an object), defaults are used too and a warning is printed to stderr. Example:
@@ -137,9 +139,39 @@ In non-race sessions (practice, qualifying, time trial) the overlay is intention
 - **Right-click** — opens a small context menu with an `Exit` option.
 - **In-game buttons** — UDP Action 1 / 2 cycle to the next / previous page.
 
+## Race-strategy tool (`strategist.py`)
+
+A standalone command-line script that chews through the CSV files written by `log_laps` and recommends pit strategies for an upcoming race on the same track / car setup. Stdlib-only Python — nothing to install or build, just run it.
+
+### Inputs
+
+- **One CSV per dry compound**, passed via `--soft`, `--medium`, and `--hard` flags. At least two of the three must be supplied. Within each file only rows whose `Tire compound` column matches the flag are used, so a multi-compound file can still be useful — its other rows are silently skipped.
+- After reading the files the tool prompts interactively for **race duration (laps)** and **pit-stop time lost (seconds)**.
+
+### Outputs
+
+1. The fastest legal **1-stop** strategy — compound per stint, stint lengths, starting fuel load, projected race time. Prints "not possible" if no compound pair keeps both stints under the 80% wear cap.
+2. The fastest legal **2-stop** strategy — same shape.
+3. A **custom-pit prompt loop.** Enter one or more pit laps separated by commas (e.g. `22` or `18, 40`). The tool returns the fastest legal strategy that uses those laps as required pits and may add up to two extra pits if doing so is faster. Blank line or Ctrl-D exits.
+
+### Pace model
+
+- Lap observations are sorted by `Tire wear on start` (a physical proxy for tire age) so samples from different stints align by tire condition rather than by position-in-stint.
+- Same-tire-age observations from different stints (within 0.5× the local wear-per-lap) are merged into median-valued clusters to avoid over-counting.
+- Real coverage gaps (>1.5× the local wear-per-lap) are filled with linearly-interpolated synthetic laps.
+- The sequence is extrapolated backward to 0% wear and forward to 80% wear via linear regression over the first / last 5 entries.
+- **You are expected to hand-clean the input CSVs** before running — remove in-laps, out-laps, traffic laps, lucky-DRS laps, etc. The tool treats every supplied row as a representative racing lap and applies no outlier filtering of its own.
+
+### Example
+
+```
+python strategist.py --soft sof.csv --medium med.csv --hard har.csv
+```
+
 ## Files
 
-- `main.py` — main application source code
+- `main.py` — overlay application source code
+- `strategist.py` — offline race-strategy calculator (consumes `log_laps` CSVs)
 - `settings.json` — configuration file (a working example is committed in the repo)
 - `assets/icon.ico` — application icon used by the build command
 - `assets/logo.png` — project logo
