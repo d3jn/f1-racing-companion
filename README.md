@@ -24,7 +24,7 @@ If you want to run/build from source then clone the repository and:
 * run: `main.py` directly with Python;
 * build: `pyinstaller --onefile --noconsole --icon=assets/icon.ico main.py` and take the resulting standalone executable from `/dist` directory.
 
-The repository also ships with `strategist.py`, an offline race-strategy calculator that consumes the CSV files produced by `log_laps`. It depends only on the Python standard library, so no separate install or build step is needed — just run `python strategist.py ...` from a clone. See the [Race-strategy tool](#race-strategy-tool-strategistpy) section below.
+The repository also ships with `strategist.py`, an offline race-strategy calculator that consumes the CSV files produced by `log_laps`. It depends only on the Python standard library, so you can just run `python strategist.py ...`. See the [Race-strategy tool](#race-strategy-tool-strategistpy) section below.
 
 ## Configuration
 
