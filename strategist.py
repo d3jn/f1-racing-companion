@@ -31,10 +31,17 @@ WEAR_CEILING = 80.0           # percent; running past this is prohibited
 MERGE_THRESHOLD = 0.5         # gap < 0.5 × local wear/lap → merge as same-age laps
 GAP_DETECTION_MULTIPLIER = 1.5  # gap > 1.5 × local wear/lap → real gap to fill
 EXTRAPOLATION_WINDOW = 5      # head/tail laps used to fit extrapolation regressions
-MAX_EXTRA_PITS = 2            # custom-schedule mode: add at most this many pits
-                              # beyond the user-required ones when searching
+MAX_FUTURE_PITS = 2           # live mode: search up to this many additional pits
+                              # beyond what's already in race history
 
 COMPOUND_FLAGS = {"soft": "SOF", "medium": "MED", "hard": "HAR"}
+COMPOUND_LABEL = {"SOF": "Soft", "MED": "Medium", "HAR": "Hard"}
+COMPOUND_PLURAL = {"SOF": "softs", "MED": "mediums", "HAR": "hards"}
+COMPOUND_PARSE = {
+    "soft": "SOF", "sof": "SOF", "s": "SOF",
+    "medium": "MED", "med": "MED", "m": "MED",
+    "hard": "HAR", "har": "HAR", "h": "HAR",
+}
 
 
 def parse_args():
@@ -47,6 +54,9 @@ def parse_args():
                         help="Path to CSV with MED laps.")
     parser.add_argument("--hard", type=str, default=None,
                         help="Path to CSV with HAR laps.")
+    parser.add_argument("--live-strategy", action="store_true",
+                        help="Skip the 1-stop / 2-stop summary and go straight "
+                             "into the interactive custom-pit prompt loop.")
     return parser.parse_args()
 
 
@@ -64,41 +74,85 @@ def prompt_positive_int(prompt):
         return n
 
 
-def parse_pit_laps(raw, total_laps):
-    """Parse comma-separated pit lap numbers. Returns sorted unique list of
-    valid lap indices (each in 1..total_laps-1), or None on any error or
-    duplicates that collapse to fewer stints than the user asked for."""
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts:
-        return None
-    try:
-        laps = [int(p) for p in parts]
-    except ValueError:
-        return None
-    if any(l < 1 or l >= total_laps for l in laps):
-        return None
-    return sorted(set(laps))
-
-
-def prompt_pit_laps(total_laps):
-    """Return a sorted unique list of pit laps, or None if the user signaled
-    end-of-input (Ctrl-D / Ctrl-C)."""
+def prompt_non_negative_int(prompt):
     while True:
+        raw = input(prompt).strip()
         try:
-            raw = input("Pit laps (comma-separated, blank line / Ctrl-D to exit): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return None
-        if not raw:
-            return None
-        laps = parse_pit_laps(raw, total_laps)
-        if laps is None:
-            print(f"  Enter one or more comma-separated lap numbers in 1..{total_laps - 1}.")
+            n = int(raw)
+        except ValueError:
+            print("  Please enter a non-negative integer.")
             continue
-        return laps
+        if n < 0:
+            print("  Please enter a non-negative integer.")
+            continue
+        return n
+
+
+def prompt_compound(prompt, allowed):
+    """Prompt for a compound name (soft / medium / hard, case-insensitive,
+    short forms accepted). 'allowed' is a set of compound codes that the
+    user is allowed to pick from."""
+    while True:
+        raw = input(prompt).strip().lower()
+        if raw in COMPOUND_PARSE:
+            code = COMPOUND_PARSE[raw]
+            if code in allowed:
+                return code
+            print(f"  '{raw}' is not available in your inventory.")
+            continue
+        print("  Please enter soft, medium, or hard.")
+
+
+def parse_pit_entry(raw, last_pit_lap, total_laps):
+    """Parse a pit-entry string. Accepted forms (order-insensitive,
+    comma- or space-separated):
+        '22'                     → (22, None, None)    hypothetical pit
+        '22 medium'              → (22, MED, 'fresh')  actual pit, fresh
+        '22 medium used'         → (22, MED, 'used')   actual pit, used set
+        '22 medium fresh'        → (22, MED, 'fresh')  actual pit, explicit
+    The hypothetical form (lap alone) asks "if I pit on this lap, what
+    should I fit and how should the rest of the race go?" without
+    mutating state. The actual forms record a pit that just happened.
+    Returns ((lap, compound, source), None) on success or
+    (None, error_message) on failure."""
+    parts = [p for p in raw.replace(",", " ").split() if p]
+    if len(parts) == 1:
+        try:
+            lap = int(parts[0])
+        except ValueError:
+            return None, ("Format: '<lap>' (hypothetical) or "
+                          "'<lap> <compound> [fresh|used]' (actual pit).")
+        if lap <= last_pit_lap:
+            return None, f"Pit lap must be greater than the previous pit lap ({last_pit_lap})."
+        if lap >= total_laps:
+            return None, f"Pit lap must be less than the race length ({total_laps})."
+        return (lap, None, None), None
+    if len(parts) not in (2, 3):
+        return None, ("Format: '<lap>' (hypothetical) or "
+                      "'<lap> <compound> [fresh|used]' (actual pit).")
+    lap, compound, source = None, None, "fresh"
+    for p in parts:
+        pl = p.lower()
+        if compound is None and pl in COMPOUND_PARSE:
+            compound = COMPOUND_PARSE[pl]
+        elif pl in ("fresh", "used"):
+            source = pl
+        elif lap is None:
+            try:
+                lap = int(p)
+            except ValueError:
+                pass
+    if lap is None or compound is None:
+        return None, "Couldn't parse lap or compound. Try '22 medium'."
+    if lap <= last_pit_lap:
+        return None, f"Pit lap must be greater than the previous pit lap ({last_pit_lap})."
+    if lap >= total_laps:
+        return None, f"Pit lap must be less than the race length ({total_laps})."
+    return (lap, compound, source), None
 
 
 def stint_lengths_from_pit_laps(pit_laps, total_laps):
-    """Given sorted unique pit laps, return the resulting stint lengths."""
+    """Given sorted pit laps, return the resulting stint lengths."""
     lengths = []
     prev = 0
     for pit in pit_laps:
@@ -108,19 +162,111 @@ def stint_lengths_from_pit_laps(pit_laps, total_laps):
     return lengths
 
 
-def pit_laps_label(required_pits, actual_pits):
-    """Build a heading line describing the chosen schedule. Notes which
-    pit laps the user required vs which the search added."""
-    actual_str = ", ".join(str(l) for l in actual_pits)
-    lap_word = "lap" if len(actual_pits) == 1 else "laps"
-    pit_word = "pit" if len(actual_pits) == 1 else "pits"
-    base = f"Optimal strategy for {pit_word} on {lap_word} {actual_str}"
-    extras = [l for l in actual_pits if l not in required_pits]
-    if extras:
-        ex_lap_word = "lap" if len(extras) == 1 else "laps"
-        ex_str = ", ".join(str(l) for l in extras)
-        base += f" (added {ex_lap_word} {ex_str})"
-    return base
+def _compound_with_source(compound, source):
+    return f"{compound}(used)" if source == "used" else compound
+
+
+def _format_tires_available(state, sequences):
+    """One-liner showing fresh counts and used sets with their wear."""
+    pieces = []
+    for c in ("SOF", "MED", "HAR"):
+        if c not in sequences:
+            continue
+        fresh = state["fresh_inventory"].get(c, 0)
+        used = sorted([u["wear"] for u in state["used_pool"] if u["compound"] == c])
+        if fresh == 0 and not used:
+            continue
+        bits = []
+        if fresh > 0:
+            bits.append(f"{fresh} fresh")
+        if used:
+            wear_strs = ", ".join(f"{w:.0f}%" for w in used)
+            bits.append(f"{len(used)} used ({wear_strs})")
+        pieces.append(f"{c}: {' + '.join(bits)}")
+    return "; ".join(pieces)
+
+
+def _apply_pit(state, lap, compound, source, sequences):
+    """Mutate state to reflect an actual pit at `lap` switching to
+    (compound, source). The just-removed set is pushed into the used
+    pool with its end-of-stint wear; the new set is drawn from either
+    fresh inventory or the used pool (least-worn of the requested
+    compound). Returns an error string on failure, or None on success."""
+    current = state["current_set"]
+    cur_seq = sequences[current["compound"]]
+    start_idx = wear_to_position(cur_seq, current["wear"])
+    stint_len = lap - state["current_stint_start_lap"]
+    if stint_len < 1:
+        return "Pit lap must be after the start of the current stint."
+    if start_idx + stint_len > cur_seq["max_laps"]:
+        return (f"Current {current['compound']} set can't run a {stint_len}-lap stint "
+                f"from {current['wear']:.1f}% wear without exceeding 80% wear.")
+    end_wear = compute_end_wear(cur_seq, start_idx, stint_len)
+
+    # Pick the new set from fresh inventory or the used pool.
+    if source == "fresh":
+        if state["fresh_inventory"].get(compound, 0) <= 0:
+            return (f"No fresh {COMPOUND_PLURAL[compound]} available. "
+                    f"Try '{lap} {COMPOUND_LABEL[compound].lower()} used' to re-fit a used set.")
+        state["fresh_inventory"][compound] -= 1
+        new_set = {"compound": compound, "wear": 0.0, "source": "fresh"}
+    else:  # source == "used"
+        candidates = [(i, u) for i, u in enumerate(state["used_pool"]) if u["compound"] == compound]
+        if not candidates:
+            return f"No used {COMPOUND_PLURAL[compound]} available to re-fit."
+        lw_idx, lw_set = min(candidates, key=lambda x: x[1]["wear"])
+        target_seq = sequences[compound]
+        if wear_to_position(target_seq, lw_set["wear"]) >= target_seq["max_laps"]:
+            return (f"Least-worn used {COMPOUND_LABEL[compound].lower()} set is at "
+                    f"{lw_set['wear']:.1f}% — no usable laps left under 80%.")
+        state["used_pool"].pop(lw_idx)
+        new_set = {"compound": compound, "wear": lw_set["wear"], "source": "used"}
+
+    # Record the just-completed stint and stash the removed set in the pool.
+    state["completed_stints"].append({
+        "compound": current["compound"],
+        "length": stint_len,
+        "source": current["source"],
+        "start_wear": current["wear"],
+        "pit_lap_after": lap,
+    })
+    state["used_pool"].append({"compound": current["compound"], "wear": end_wear})
+
+    state["current_set"] = new_set
+    state["current_stint_start_lap"] = lap
+    return None
+
+
+def format_live_plan(plan, state, total_laps, sequences, hypothetical_lap=None):
+    """Render a live-mode plan with done / current / future phase tags,
+    fresh-vs-used annotations per stint, projected race time, and the
+    remaining tire pool. If `hypothetical_lap` is set the heading reads
+    as a what-if instead of a state-derived plan."""
+    if plan is None:
+        if hypothetical_lap is not None:
+            return f"No legal strategy if pitting at lap {hypothetical_lap}."
+        return "No legal strategy from current state."
+    if hypothetical_lap is not None:
+        lines = [f"Hypothetical: if pitting at lap {hypothetical_lap}, optimal plan is:"]
+    else:
+        lines = ["Optimal plan from current state:"]
+    cumulative = 0
+    for i, s in enumerate(plan["stints"]):
+        end_lap = cumulative + s["length"]
+        cumulative = end_lap
+        if s["phase"] == "done":
+            note = "done"
+        elif s["phase"] == "current":
+            note = f"current; pit on lap {end_lap}" if end_lap < total_laps else "current; runs to end of race"
+        else:
+            note = f"pit on lap {end_lap}" if end_lap < total_laps else "to end of race"
+        label = _compound_with_source(s["compound"], s["source"])
+        lines.append(f"  Stint {i+1}: {label}, {s['length']} laps ({note})")
+    lines.append(f"  Estimated race time: {format_time(plan['total'])}")
+    avail = _format_tires_available(state, sequences)
+    if avail:
+        lines.append(f"  Tires available: {avail}")
+    return "\n".join(lines)
 
 
 def read_compound_rows(path, target_compound):
@@ -236,8 +382,13 @@ def build_sequence(rows):
       5) Forward-extrapolate to 80 % wear with the same kind of regression
          over the last 5 entries.
 
-    Returns a list of dicts (one per lap, indexed chronologically from 0%
-    wear) with keys: lap_time, wear_delta, fuel_delta, wear_on_start.
+    Returns a dict with:
+      - "laps": list of per-lap dicts (lap_time, wear_delta, fuel_delta,
+                wear_on_start), indexed chronologically from 0 % wear.
+      - "cum_time" / "cum_fuel": cumulative-sum arrays (length len+1, with
+                cum[0] = 0) so stint_time / stint_fuel are O(1).
+      - "max_laps": len of the laps list (number of laps before hitting the
+                80 % wear cap).
     """
     if not rows:
         return []
@@ -325,15 +476,48 @@ def build_sequence(rows):
         cumulative_end += wd
         pos += 1
 
-    return sequence
+    cum_time = [0.0]
+    cum_fuel = [0.0]
+    for entry in sequence:
+        cum_time.append(cum_time[-1] + entry["lap_time"])
+        cum_fuel.append(cum_fuel[-1] + entry["fuel_delta"])
+    return {
+        "laps": sequence,
+        "cum_time": cum_time,
+        "cum_fuel": cum_fuel,
+        "max_laps": len(sequence),
+    }
 
 
-def stint_time(seq, laps):
-    return sum(r["lap_time"] for r in seq[:laps])
+def stint_time(seq, length, start_idx=0):
+    """Time for a stint of `length` laps starting from sequence position
+    `start_idx`. start_idx > 0 represents a used tire being re-fitted at
+    some accumulated wear; start_idx = 0 is a fresh tire."""
+    return seq["cum_time"][start_idx + length] - seq["cum_time"][start_idx]
 
 
-def stint_fuel(seq, laps):
-    return sum(r["fuel_delta"] for r in seq[:laps])
+def stint_fuel(seq, length, start_idx=0):
+    return seq["cum_fuel"][start_idx + length] - seq["cum_fuel"][start_idx]
+
+
+def wear_to_position(seq, target_wear):
+    """Position in the wear-sorted sequence whose `wear_on_start` first
+    reaches `target_wear`. Returns max_laps if target is past the 80 %
+    ceiling (i.e. the tire is effectively dead)."""
+    laps = seq["laps"]
+    for i in range(len(laps)):
+        if laps[i]["wear_on_start"] >= target_wear:
+            return i
+    return seq["max_laps"]
+
+
+def compute_end_wear(seq, start_idx, length):
+    """Wear at the END of a stint that ran `length` laps starting at
+    sequence position `start_idx`."""
+    if length <= 0:
+        return seq["laps"][start_idx]["wear_on_start"]
+    end = seq["laps"][start_idx + length - 1]
+    return end["wear_on_start"] + end["wear_delta"]
 
 
 def search_one_stop(sequences, total_laps, pit_loss):
@@ -347,7 +531,7 @@ def search_one_stop(sequences, total_laps, pit_loss):
             if a == b:
                 continue
             seq_a, seq_b = sequences[a], sequences[b]
-            max_a, max_b = len(seq_a), len(seq_b)
+            max_a, max_b = seq_a["max_laps"], seq_b["max_laps"]
             for k in range(1, total_laps):
                 if k > max_a:
                     break
@@ -364,62 +548,6 @@ def search_one_stop(sequences, total_laps, pit_loss):
     return best
 
 
-def search_fixed_stops(sequences, stint_lengths, pit_loss):
-    """Given fixed stint lengths (derived from a complete pit-lap set),
-    enumerate all compound assignments and return the fastest legal one.
-    Must include ≥2 distinct compounds and respect each compound's
-    max_laps. Returns None if no legal assignment exists."""
-    num_stints = len(stint_lengths)
-    compounds = list(sequences.keys())
-    # Cheap early reject: if any stint length exceeds every compound's
-    # max_laps, no assignment is legal.
-    max_overall = max(len(sequences[c]) for c in compounds)
-    if any(l > max_overall for l in stint_lengths):
-        return None
-    best = None
-    for combo in itertools.product(compounds, repeat=num_stints):
-        if len(set(combo)) < 2:
-            continue
-        if any(stint_lengths[i] > len(sequences[combo[i]])
-               for i in range(num_stints)):
-            continue
-        total = sum(stint_time(sequences[c], l)
-                    for c, l in zip(combo, stint_lengths))
-        total += pit_loss * (num_stints - 1)
-        if best is None or total < best["total"]:
-            best = {
-                "stints": list(zip(combo, stint_lengths)),
-                "total": total,
-                "fuel": sum(stint_fuel(sequences[c], l)
-                            for c, l in zip(combo, stint_lengths)),
-            }
-    return best
-
-
-def search_required_pits(sequences, required_pits, total_laps, pit_loss):
-    """Required pit laps must appear as stint-ends. Search every pit-lap
-    superset that adds 0..MAX_EXTRA_PITS additional pits at non-required
-    positions, and return the fastest legal plan across all of them.
-
-    Returns the best plan dict (augmented with a "pit_laps" key listing
-    the chosen schedule), or None if nothing legal exists."""
-    required = sorted(set(required_pits))
-    candidates = [l for l in range(1, total_laps) if l not in required]
-    best = None
-    for extra_count in range(MAX_EXTRA_PITS + 1):
-        for extra in itertools.combinations(candidates, extra_count):
-            all_pits = sorted(set(required) | set(extra))
-            stint_lengths = stint_lengths_from_pit_laps(all_pits, total_laps)
-            plan = search_fixed_stops(sequences, stint_lengths, pit_loss)
-            if plan is None:
-                continue
-            if best is None or plan["total"] < best["total"]:
-                plan = dict(plan)
-                plan["pit_laps"] = all_pits
-                best = plan
-    return best
-
-
 def search_two_stop(sequences, total_laps, pit_loss):
     """≥2 distinct compounds across the three stints. Returns the fastest
     legal 2-stop plan or None."""
@@ -431,7 +559,7 @@ def search_two_stop(sequences, total_laps, pit_loss):
                 if a == b == c:
                     continue
                 seq_a, seq_b, seq_c = sequences[a], sequences[b], sequences[c]
-                max_a, max_b, max_c = len(seq_a), len(seq_b), len(seq_c)
+                max_a, max_b, max_c = seq_a["max_laps"], seq_b["max_laps"], seq_c["max_laps"]
                 for k1 in range(1, total_laps - 1):
                     if k1 > max_a:
                         break
@@ -454,6 +582,149 @@ def search_two_stop(sequences, total_laps, pit_loss):
                                          + stint_fuel(seq_c, k3)),
                             }
     return best
+
+
+def _historical_summary(state, sequences, pit_loss):
+    """Compute aggregate (time, fuel) and an annotated stint list for the
+    portion of the race that has already happened."""
+    stints = []
+    total_time = 0.0
+    total_fuel = 0.0
+    for cs in state["completed_stints"]:
+        seq = sequences[cs["compound"]]
+        start_idx = wear_to_position(seq, cs["start_wear"])
+        total_time += stint_time(seq, cs["length"], start_idx)
+        total_fuel += stint_fuel(seq, cs["length"], start_idx)
+        stints.append({
+            "compound": cs["compound"],
+            "length": cs["length"],
+            "source": cs["source"],
+            "phase": "done",
+        })
+    total_time += len(state["completed_stints"]) * pit_loss
+    return stints, total_time, total_fuel
+
+
+def _stint_entry(current_set, length, phase):
+    return {
+        "compound": current_set["compound"],
+        "length": length,
+        "source": current_set["source"],
+        "phase": phase,
+    }
+
+
+def search_live(state, total_laps, pit_loss, sequences, forced_next_pit_lap=None):
+    """Recursive search for the fastest legal continuation of the race.
+
+    Historical (completed) stints are locked. The currently-mounted set's
+    compound is locked but its remaining length is a search variable.
+    Up to MAX_FUTURE_PITS more pits may be added; at each, the next set
+    is either a fresh inventory unit or the least-worn used set of a
+    compound (the "least-worn" convention matches the UI rule for how
+    the user enters "<lap> <compound> used").
+
+    Sets returning to the used pool keep their accumulated wear, so the
+    same physical set can be re-fitted later as long as its starting
+    wear leaves it room under 80 % for the next stint.
+
+    If `forced_next_pit_lap` is set, the first future pit must happen at
+    exactly that lap — used by the hypothetical-pit prompt to answer
+    "if I pit here, which tire and what's optimal after?". The
+    no-more-pits ("run to end of race") option is disabled for the
+    first decision in that case, since the user is asking *given* a
+    pit at that lap."""
+    historical_stints, historical_time, historical_fuel = _historical_summary(
+        state, sequences, pit_loss)
+    best = [None]
+
+    def explore(future_stints, current_set, fresh_inv, used_pool, current_lap,
+                accum_time, accum_fuel, pits_done):
+        seq = sequences[current_set["compound"]]
+        start_idx = wear_to_position(seq, current_set["wear"])
+        remaining = total_laps - current_lap
+        max_remaining = seq["max_laps"] - start_idx
+        is_forced_first = forced_next_pit_lap is not None and pits_done == 0
+
+        # Option A: keep current set on for the rest of the race.
+        # Skip when the user forced a first pit (they're asking *given* a pit).
+        if not is_forced_first and 1 <= remaining <= max_remaining:
+            stint_t = stint_time(seq, remaining, start_idx)
+            stint_f = stint_fuel(seq, remaining, start_idx)
+            full = (historical_stints + future_stints
+                    + [_stint_entry(current_set, remaining,
+                                    "current" if pits_done == 0 else "future")])
+            if len({s["compound"] for s in full}) >= 2:
+                total = accum_time + stint_t
+                if best[0] is None or total < best[0]["total"]:
+                    best[0] = {
+                        "stints": full,
+                        "total": total,
+                        "fuel": accum_fuel + stint_f,
+                    }
+
+        # Option B: pit at some lap, then pick a tire and continue
+        if pits_done >= MAX_FUTURE_PITS:
+            return
+
+        if is_forced_first:
+            forced_len = forced_next_pit_lap - current_lap
+            if forced_len < 1 or forced_len > max_remaining:
+                return
+            stint_lens = [forced_len]
+        else:
+            stint_lens = range(1, min(remaining, max_remaining) + 1)
+
+        for stint_len in stint_lens:
+            pit_lap = current_lap + stint_len
+            if pit_lap >= total_laps:
+                break
+            stint_t = stint_time(seq, stint_len, start_idx)
+            stint_f = stint_fuel(seq, stint_len, start_idx)
+            end_wear = compute_end_wear(seq, start_idx, stint_len)
+
+            stint_entry = _stint_entry(current_set, stint_len,
+                                       "current" if pits_done == 0 else "future")
+            next_future = future_stints + [stint_entry]
+            next_used = used_pool + [{"compound": current_set["compound"],
+                                      "wear": end_wear}]
+            next_time = accum_time + stint_t + pit_loss
+            next_fuel = accum_fuel + stint_f
+
+            # Fresh tire choices
+            for c in fresh_inv:
+                if fresh_inv[c] <= 0:
+                    continue
+                new_fresh = dict(fresh_inv)
+                new_fresh[c] -= 1
+                explore(
+                    next_future,
+                    {"compound": c, "wear": 0.0, "source": "fresh"},
+                    new_fresh, next_used, pit_lap,
+                    next_time, next_fuel, pits_done + 1,
+                )
+
+            # Re-fit choices (least-worn used set per compound)
+            for c in sequences:
+                of_c = [(i, u) for i, u in enumerate(next_used)
+                        if u["compound"] == c]
+                if not of_c:
+                    continue
+                lw_idx, lw_set = min(of_c, key=lambda x: x[1]["wear"])
+                if wear_to_position(sequences[c], lw_set["wear"]) >= sequences[c]["max_laps"]:
+                    continue
+                new_used = next_used[:lw_idx] + next_used[lw_idx + 1:]
+                explore(
+                    next_future,
+                    {"compound": c, "wear": lw_set["wear"], "source": "used"},
+                    fresh_inv, new_used, pit_lap,
+                    next_time, next_fuel, pits_done + 1,
+                )
+
+    explore([], state["current_set"], state["fresh_inventory"],
+            list(state["used_pool"]), state["current_stint_start_lap"],
+            historical_time, historical_fuel, 0)
+    return best[0]
 
 
 def format_time(seconds):
@@ -512,29 +783,82 @@ def main():
     pit_loss = prompt_positive_int("Pit-stop time lost (seconds): ")
     print()
 
-    one_stop = search_one_stop(sequences, total_laps, pit_loss)
-    two_stop = search_two_stop(sequences, total_laps, pit_loss)
+    if not args.live_strategy:
+        one_stop = search_one_stop(sequences, total_laps, pit_loss)
+        two_stop = search_two_stop(sequences, total_laps, pit_loss)
+        print(format_plan("1-stop strategy", one_stop))
+        print()
+        print(format_plan("2-stop strategy", two_stop))
+        return 0
 
-    print(format_plan("1-stop strategy", one_stop))
+    # --live-strategy: track an in-progress race. Ask for the tire
+    # inventory and starting compound, then enter a prompt loop that
+    # consumes actual pit events as they happen and re-plans the rest of
+    # the race after each one. Per-set wear is tracked so that re-fitting
+    # a used set is a possible option whenever it would be faster.
+    fresh_inventory = {}
+    for code in ("SOF", "MED", "HAR"):
+        if code in sequences:
+            fresh_inventory[code] = prompt_non_negative_int(
+                f"How many {COMPOUND_PLURAL[code]} do you have for the race? ")
+        else:
+            fresh_inventory[code] = 0
+
+    available_for_start = {c for c in sequences if fresh_inventory[c] > 0}
+    if not available_for_start:
+        print("Error: no tires available for any provided compound — "
+              "nothing to start the race on.", file=sys.stderr)
+        return 1
+
+    starting = prompt_compound("What compound are we starting on? ", available_for_start)
+    fresh_inventory[starting] -= 1
+
+    state = {
+        "starting_compound": starting,
+        "fresh_inventory": fresh_inventory,
+        "used_pool": [],
+        "current_set": {"compound": starting, "wear": 0.0, "source": "fresh"},
+        "completed_stints": [],
+        "current_stint_start_lap": 0,
+    }
+
     print()
-    print(format_plan("2-stop strategy", two_stop))
+    plan = search_live(state, total_laps, pit_loss, sequences)
+    print(format_live_plan(plan, state, total_laps, sequences))
     print()
 
     while True:
-        pit_laps = prompt_pit_laps(total_laps)
-        if pit_laps is None:
+        try:
+            raw = input("Enter pit ('22' hypothetical, '22 medium' actual, "
+                        "'22 medium used' refit), blank line / Ctrl-D to exit: ").strip()
+        except (EOFError, KeyboardInterrupt):
             print()
             return 0
+        if not raw:
+            print()
+            return 0
+        parsed, err = parse_pit_entry(raw, state["current_stint_start_lap"], total_laps)
+        if err:
+            print("  " + err)
+            continue
+        lap, compound, source = parsed
+
         print()
-        plan = search_required_pits(sequences, pit_laps, total_laps, pit_loss)
-        if plan is None:
-            req_str = ", ".join(str(l) for l in pit_laps)
-            lap_word = "lap" if len(pit_laps) == 1 else "laps"
-            print(f"No legal strategy found for required pit on {lap_word} {req_str} "
-                  f"(every compound choice exceeds 80% tire wear).")
+        if compound is None:
+            # Hypothetical: ask "what's optimal IF I pit here?" without
+            # mutating state.
+            plan = search_live(state, total_laps, pit_loss, sequences,
+                               forced_next_pit_lap=lap)
+            print(format_live_plan(plan, state, total_laps, sequences,
+                                   hypothetical_lap=lap))
         else:
-            label = pit_laps_label(pit_laps, plan["pit_laps"])
-            print(format_plan(label, plan))
+            err = _apply_pit(state, lap, compound, source, sequences)
+            if err:
+                print("  " + err)
+                print()
+                continue
+            plan = search_live(state, total_laps, pit_loss, sequences)
+            print(format_live_plan(plan, state, total_laps, sequences))
         print()
 
 

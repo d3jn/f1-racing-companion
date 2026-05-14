@@ -150,9 +150,26 @@ A standalone command-line script that chews through the CSV files written by `lo
 
 ### Outputs
 
+The tool has two modes selected at launch:
+
+**Default mode** (no extra flags): prints two strategies and exits.
+
 1. The fastest legal **1-stop** strategy — compound per stint, stint lengths, starting fuel load, projected race time. Prints "not possible" if no compound pair keeps both stints under the 80% wear cap.
 2. The fastest legal **2-stop** strategy — same shape.
-3. A **custom-pit prompt loop.** Enter one or more pit laps separated by commas (e.g. `22` or `18, 40`). The tool returns the fastest legal strategy that uses those laps as required pits and may add up to two extra pits if doing so is faster. Blank line or Ctrl-D exits.
+
+**Live-strategy mode** (`--live-strategy`): designed to be used *during* a race. After reading the CSVs the tool asks for:
+
+1. How many sets of each compound you have available for the race (only compounds passed via `--soft` / `--medium` / `--hard` are asked about; others default to 0).
+2. The compound you're starting on (one of those you have inventory for).
+
+It then prints the optimal whole-race plan given that starting compound and inventory, respecting the F1 ≥2-distinct-compound rule and the 80 % wear cap on each future stint. After that it enters a prompt loop with two input forms:
+
+- **Actual pit** — `<lap> <compound>` (e.g. `22 medium`, order-insensitive, short forms like `s`/`m`/`h` accepted). Records that the pit just happened: appends to the completed stints, decrements/updates the tire pool, and re-plans the rest of the race from that point forward (up to 2 more pits past whatever's already happened).
+- **Hypothetical pit** — just `<lap>` (a single integer). Asks "if I'm forced to pit on this lap, which tire should I fit and what's optimal after?" without mutating state — the answer shows the recommended tire for that forced pit and the best continuation, then the next prompt is still the live state.
+
+Per-set tire wear is tracked: when you pit, the set just removed goes into a *used pool* with the wear it accumulated during the stint, and the strategist will consider re-fitting it later if doing so is faster (and the set's starting wear leaves room under 80 %). A stint that re-fits a used set is rendered as `MED(used)` to distinguish it from a fresh-tire stint. To match that in your input, append `used` (e.g. `22 medium used`) when refitting; otherwise the entry is treated as a fresh set. If multiple used sets of the same compound exist, both the strategist's recommendation and the `used` keyword always refer to the **least-worn** one.
+
+Blank line or Ctrl-D exits.
 
 ### Pace model
 
@@ -162,10 +179,16 @@ A standalone command-line script that chews through the CSV files written by `lo
 - The sequence is extrapolated backward to 0% wear and forward to 80% wear via linear regression over the first / last 5 entries.
 - **You are expected to hand-clean the input CSVs** before running — remove in-laps, out-laps, traffic laps, lucky-DRS laps, etc. The tool treats every supplied row as a representative racing lap and applies no outlier filtering of its own.
 
-### Example
+### Examples
 
+Default mode (1-stop + 2-stop summary):
 ```
 python strategist.py --soft sof.csv --medium med.csv --hard har.csv
+```
+
+Live-strategy mode (interactive custom-pit loop):
+```
+python strategist.py --live-strategy --soft sof.csv --medium med.csv --hard har.csv
 ```
 
 ## Files
