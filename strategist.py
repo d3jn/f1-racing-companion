@@ -325,6 +325,36 @@ def _safe_local_wpl(window_clusters, fallback):
     return wpl if wpl > 0 else fallback
 
 
+def _isotonic_lap_times(values):
+    """Pool Adjacent Violators Algorithm. Returns the L2-optimal
+    non-decreasing fit of `values` — every adjacent decreasing pair is
+    pooled into a single block carrying their weighted mean, and the
+    pooling cascades backward until monotonicity is restored.
+
+    Used to denoise lap_time: real tire degradation only slows the car
+    over a stint, so any downtick is sampling noise. wear_delta and
+    fuel_delta are not run through this — both legitimately fall as fuel
+    burns off, the track rubbers in, etc.
+
+    Result is piecewise-constant across noisy regions but preserves
+    observations verbatim wherever they already trend up.
+    """
+    stack = []  # list of [sum, count]; block mean = sum / count
+    for v in values:
+        s, c = v, 1
+        # Cross-multiplied comparison avoids per-step float division.
+        # Safe: all lap times are positive.
+        while stack and stack[-1][0] * c > s * stack[-1][1]:
+            ps, pc = stack.pop()
+            s += ps
+            c += pc
+        stack.append([s, c])
+    out = []
+    for s, c in stack:
+        out.extend([s / c] * c)
+    return out
+
+
 def _merge_overlapping(sorted_rows, fallback_wpl):
     """Iteratively merge adjacent observations that came from different stints
     but sampled the same tire age.
@@ -381,6 +411,9 @@ def build_sequence(rows):
          entries (lap_time, wear_delta, fuel_delta each vs sequence pos).
       5) Forward-extrapolate to 80 % wear with the same kind of regression
          over the last 5 entries.
+      6) Enforce monotonic non-decreasing lap_time via PAVA (isotonic
+         regression). wear_delta and fuel_delta are left alone — both can
+         legitimately fall as fuel burns off and the track rubbers in.
 
     Returns a dict with:
       - "laps": list of per-lap dicts (lap_time, wear_delta, fuel_delta,
@@ -475,6 +508,10 @@ def build_sequence(rows):
         })
         cumulative_end += wd
         pos += 1
+
+    smoothed = _isotonic_lap_times([r["lap_time"] for r in sequence])
+    for r, lt in zip(sequence, smoothed):
+        r["lap_time"] = lt
 
     cum_time = [0.0]
     cum_fuel = [0.0]
