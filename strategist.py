@@ -34,6 +34,8 @@ GAP_DETECTION_MULTIPLIER = 1.5  # gap > 1.5 × local wear/lap → real gap to fi
 EXTRAPOLATION_WINDOW = 5      # head/tail laps used to fit extrapolation regressions
 MAX_FUTURE_PITS = 2           # live mode: search up to this many additional pits
                               # beyond what's already in race history
+PIT_WINDOW_TOLERANCE = 1.0    # seconds; pit window = range of laps that keep
+                              # total race time within this of the optimum
 
 COMPOUND_FLAGS = {"soft": "SOF", "medium": "MED", "hard": "HAR"}
 COMPOUND_LABEL = {"SOF": "Soft", "MED": "Medium", "HAR": "Hard"}
@@ -256,6 +258,7 @@ def format_live_plan(plan, state, total_laps, sequences, hypothetical_lap=None):
         lines = [f"Hypothetical: if pitting at lap {hypothetical_lap}, optimal plan is:"]
     else:
         lines = ["Optimal plan from current state:"]
+    windows = pit_windows(plan["stints"], plan["total"], sequences)
     cumulative = 0
     for i, s in enumerate(plan["stints"]):
         end_lap = cumulative + s["length"]
@@ -266,6 +269,13 @@ def format_live_plan(plan, state, total_laps, sequences, hypothetical_lap=None):
             note = f"current; pit on lap {end_lap}" if end_lap < total_laps else "current; runs to end of race"
         else:
             note = f"pit on lap {end_lap}" if end_lap < total_laps else "to end of race"
+        # In hypothetical mode the current stint's pit is forced by the
+        # user — its window would be misleading, so skip it. Other pits
+        # remain free variables and get windows.
+        suppress = hypothetical_lap is not None and s["phase"] == "current"
+        w = windows.get(i)
+        if w is not None and not suppress:
+            note = f"{note}, window {w[0]}-{w[1]}"
         label = _compound_with_source(s["compound"], s["source"])
         lines.append(f"  Stint {i+1}: {label}, {s['length']} laps ({note})")
     lines.append(f"  Estimated race time: {format_time(plan['total'])}")
@@ -642,6 +652,7 @@ def _historical_summary(state, sequences, pit_loss):
             "compound": cs["compound"],
             "length": cs["length"],
             "source": cs["source"],
+            "start_wear": cs["start_wear"],
             "phase": "done",
         })
     total_time += len(state["completed_stints"]) * pit_loss
@@ -653,6 +664,7 @@ def _stint_entry(current_set, length, phase):
         "compound": current_set["compound"],
         "length": length,
         "source": current_set["source"],
+        "start_wear": current_set["wear"],
         "phase": phase,
     }
 
@@ -768,6 +780,83 @@ def search_live(state, total_laps, pit_loss, sequences, forced_next_pit_lap=None
             list(state["used_pool"]), state["current_stint_start_lap"],
             historical_time, historical_fuel, 0)
     return best[0]
+
+
+def pit_windows(plan_stints, optimal_total, sequences,
+                tolerance=PIT_WINDOW_TOLERANCE):
+    """For each non-done pit in `plan_stints`, return (earliest_lap,
+    latest_lap) — the inclusive range of pit laps that keep total race
+    time within `tolerance` seconds of `optimal_total`, holding every
+    other pit at its optimal lap.
+
+    The neighbouring stint's length is adjusted to compensate so that
+    pit p+1 stays put: if pit p moves earlier by k laps, stint p+1
+    starts k laps earlier and ends at the same lap. This matches the
+    spec "other pitstops are optimal".
+
+    Accepts both default-mode (`(compound, length)` tuple) and live-mode
+    (dict with `compound`, `length`, `start_wear`, `phase` keys) stint
+    formats. Returns dict keyed by stint index (the stint whose end is
+    the pit). Done-phase stints are skipped; the final stint has no
+    trailing pit.
+    """
+    norm = []
+    for s in plan_stints:
+        if isinstance(s, tuple):
+            compound, length = s
+            start_idx = 0
+            phase = "future"
+        else:
+            compound = s["compound"]
+            length = s["length"]
+            phase = s["phase"]
+            start_idx = (0 if phase == "done"
+                         else wear_to_position(sequences[compound], s["start_wear"]))
+        norm.append({
+            "length": length,
+            "start_idx": start_idx,
+            "phase": phase,
+            "sequence": sequences[compound],
+        })
+
+    if len(norm) < 2:
+        return {}
+
+    windows = {}
+    for p in range(len(norm) - 1):
+        if norm[p]["phase"] == "done":
+            continue
+        s_a, s_b = norm[p], norm[p + 1]
+        original_a, original_b = s_a["length"], s_b["length"]
+        combined = original_a + original_b
+        max_a = s_a["sequence"]["max_laps"] - s_a["start_idx"]
+        max_b = s_b["sequence"]["max_laps"] - s_b["start_idx"]
+
+        t_a = stint_time(s_a["sequence"], original_a, s_a["start_idx"])
+        t_b = stint_time(s_b["sequence"], original_b, s_b["start_idx"])
+        other_time = optimal_total - t_a - t_b  # all other stints + pit losses
+
+        start_of_stint_p = sum(norm[i]["length"] for i in range(p))
+
+        earliest = None
+        latest = None
+        for alt_a in range(1, combined):
+            alt_b = combined - alt_a
+            if alt_a > max_a or alt_b > max_b:
+                continue
+            alt_total = (other_time
+                         + stint_time(s_a["sequence"], alt_a, s_a["start_idx"])
+                         + stint_time(s_b["sequence"], alt_b, s_b["start_idx"]))
+            if alt_total <= optimal_total + tolerance:
+                pit_lap = start_of_stint_p + alt_a
+                if earliest is None or pit_lap < earliest:
+                    earliest = pit_lap
+                if latest is None or pit_lap > latest:
+                    latest = pit_lap
+
+        if earliest is not None:
+            windows[p] = (earliest, latest)
+    return windows
 
 
 CHART_COLORS = {"SOF": "#d62728", "MED": "#ff8c00", "HAR": "#808080"}
@@ -899,12 +988,15 @@ def format_time(seconds):
     return f"{h}:{m:02d}:{s:06.3f}"
 
 
-def format_plan(label, plan):
+def format_plan(label, plan, sequences):
     if plan is None:
         return f"{label}: not possible (would exceed 80% tire wear)"
+    windows = pit_windows(plan["stints"], plan["total"], sequences)
     lines = [f"{label}:"]
-    for i, (compound, laps) in enumerate(plan["stints"], 1):
-        lines.append(f"  Stint {i}: {compound}, {laps} laps")
+    for i, (compound, laps) in enumerate(plan["stints"]):
+        w = windows.get(i)
+        suffix = f" ({w[0]}-{w[1]})" if w else ""
+        lines.append(f"  Stint {i+1}: {compound}, {laps} laps{suffix}")
     lines.append(f"  Starting fuel: {plan['fuel']:.3f} kg")
     lines.append(f"  Estimated race time: {format_time(plan['total'])}")
     return "\n".join(lines)
@@ -960,9 +1052,9 @@ def main():
     if not args.live_strategy:
         one_stop = search_one_stop(sequences, total_laps, pit_loss)
         two_stop = search_two_stop(sequences, total_laps, pit_loss)
-        print(format_plan("1-stop strategy", one_stop))
+        print(format_plan("1-stop strategy", one_stop, sequences))
         print()
-        print(format_plan("2-stop strategy", two_stop))
+        print(format_plan("2-stop strategy", two_stop, sequences))
         return 0
 
     # --live-strategy: track an in-progress race. Ask for the tire
