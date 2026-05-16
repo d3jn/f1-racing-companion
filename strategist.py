@@ -57,6 +57,11 @@ def parse_args():
     parser.add_argument("--live-strategy", action="store_true",
                         help="Skip the 1-stop / 2-stop summary and go straight "
                              "into the interactive custom-pit prompt loop.")
+    parser.add_argument("--chart", type=str, default=None,
+                        help="Write an SVG line chart of lap_time vs lap "
+                             "number for each supplied compound to the given "
+                             "path. No PNG support — SVG keeps the tool "
+                             "dependency-free.")
     return parser.parse_args()
 
 
@@ -764,6 +769,100 @@ def search_live(state, total_laps, pit_loss, sequences, forced_next_pit_lap=None
     return best[0]
 
 
+CHART_COLORS = {"SOF": "#d62728", "MED": "#ff8c00", "HAR": "#808080"}
+
+
+def write_chart(path, sequences):
+    """Write a hand-rolled SVG line chart of lap_time vs lap number for
+    each supplied compound. X-axis spans 1 .. max_laps across all
+    compounds; Y-axis spans from the fastest to the slowest lap observed
+    (with ~5% padding so lines don't sit on the frame). Stdlib only —
+    deliberately avoids matplotlib / Pillow to keep strategist.py
+    dependency-free.
+    """
+    W, H = 900, 540
+    pad_l, pad_r, pad_t, pad_b = 80, 140, 30, 60
+    plot_w = W - pad_l - pad_r
+    plot_h = H - pad_t - pad_b
+
+    max_laps = max(seq["max_laps"] for seq in sequences.values())
+    all_times = [r["lap_time"] for seq in sequences.values() for r in seq["laps"]]
+    y_max, y_min = max(all_times), min(all_times)
+    y_pad = (y_max - y_min) * 0.05 if y_max > y_min else 1.0
+    y_lo, y_hi = y_min - y_pad, y_max + y_pad
+    x_divisor = max_laps - 1 if max_laps > 1 else 1
+
+    def x_coord(lap):  # lap is 1-indexed
+        return pad_l + (lap - 1) / x_divisor * plot_w
+
+    def y_coord(t):
+        return pad_t + (1 - (t - y_lo) / (y_hi - y_lo)) * plot_h
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'viewBox="0 0 {W} {H}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t + plot_h}" stroke="black"/>',
+        f'<line x1="{pad_l}" y1="{pad_t + plot_h}" x2="{pad_l + plot_w}" '
+        f'y2="{pad_t + plot_h}" stroke="black"/>',
+    ]
+
+    x_step = 5 if max_laps <= 30 else 10
+    for lap in range(x_step, max_laps + 1, x_step):
+        x = x_coord(lap)
+        parts.append(f'<line x1="{x:.1f}" y1="{pad_t + plot_h}" '
+                     f'x2="{x:.1f}" y2="{pad_t + plot_h + 5}" stroke="black"/>')
+        parts.append(f'<text x="{x:.1f}" y="{pad_t + plot_h + 18}" '
+                     f'font-family="sans-serif" font-size="11" '
+                     f'text-anchor="middle">{lap}</text>')
+    parts.append(f'<text x="{pad_l + plot_w / 2}" y="{H - 15}" '
+                 f'font-family="sans-serif" font-size="13" '
+                 f'text-anchor="middle">Lap</text>')
+
+    n_ticks = 6
+    for i in range(n_ticks + 1):
+        t = y_lo + i * (y_hi - y_lo) / n_ticks
+        y = y_coord(t)
+        parts.append(f'<line x1="{pad_l - 5}" y1="{y:.1f}" '
+                     f'x2="{pad_l}" y2="{y:.1f}" stroke="black"/>')
+        parts.append(f'<text x="{pad_l - 8}" y="{y + 4:.1f}" '
+                     f'font-family="sans-serif" font-size="11" '
+                     f'text-anchor="end">{t:.2f}</text>')
+    parts.append(f'<text x="20" y="{pad_t + plot_h / 2}" '
+                 f'font-family="sans-serif" font-size="13" '
+                 f'text-anchor="middle" '
+                 f'transform="rotate(-90 20,{pad_t + plot_h / 2})">'
+                 f'Lap time (s)</text>')
+
+    for compound in ("SOF", "MED", "HAR"):
+        if compound not in sequences:
+            continue
+        laps = sequences[compound]["laps"]
+        pts = " ".join(f"{x_coord(i + 1):.1f},{y_coord(r['lap_time']):.1f}"
+                       for i, r in enumerate(laps))
+        parts.append(f'<polyline points="{pts}" fill="none" '
+                     f'stroke="{CHART_COLORS[compound]}" stroke-width="2"/>')
+
+    legend_x = pad_l + plot_w + 20
+    legend_y = pad_t + 10
+    line_i = 0
+    for compound in ("SOF", "MED", "HAR"):
+        if compound not in sequences:
+            continue
+        y = legend_y + line_i * 22
+        parts.append(f'<line x1="{legend_x}" y1="{y}" '
+                     f'x2="{legend_x + 24}" y2="{y}" '
+                     f'stroke="{CHART_COLORS[compound]}" stroke-width="3"/>')
+        parts.append(f'<text x="{legend_x + 30}" y="{y + 4}" '
+                     f'font-family="sans-serif" font-size="12">'
+                     f'{COMPOUND_LABEL[compound]}</text>')
+        line_i += 1
+
+    parts.append('</svg>')
+    with open(path, "w") as f:
+        f.write("\n".join(parts))
+
+
 def format_time(seconds):
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -815,6 +914,15 @@ def main():
                   file=sys.stderr)
             return 1
         sequences[compound] = build_sequence(rows)
+
+    if args.chart:
+        try:
+            write_chart(args.chart, sequences)
+        except OSError as e:
+            print(f"Error writing chart to {args.chart}: {e}", file=sys.stderr)
+            return 1
+        print(f"Wrote chart to {args.chart}")
+        print()
 
     total_laps = prompt_positive_int("Race duration (laps): ")
     pit_loss = prompt_positive_int("Pit-stop time lost (seconds): ")
