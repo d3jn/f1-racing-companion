@@ -24,6 +24,7 @@ Known limitations:
 import argparse
 import csv
 import itertools
+import math
 import statistics
 import sys
 
@@ -807,8 +808,38 @@ def write_chart(path, sequences):
         f'y2="{pad_t + plot_h}" stroke="black"/>',
     ]
 
-    x_step = 5 if max_laps <= 30 else 10
-    for lap in range(x_step, max_laps + 1, x_step):
+    x_step = 5
+    x_tick_laps = list(range(x_step, max_laps + 1, x_step))
+
+    # Y ticks: anchor labels at the actual min and max lap times, then
+    # add whole-number ticks in between — but skip any whole number whose
+    # pixel position is too close to the min/max label to render cleanly.
+    min_label_y = y_coord(y_min)
+    max_label_y = y_coord(y_max)
+    MIN_LABEL_GAP_PX = 15
+    y_ticks = [(y_min, f"{y_min:.2f}")]
+    for w in range(math.ceil(y_min), math.floor(y_max) + 1):
+        yp = y_coord(w)
+        if abs(yp - min_label_y) < MIN_LABEL_GAP_PX:
+            continue
+        if abs(yp - max_label_y) < MIN_LABEL_GAP_PX:
+            continue
+        y_ticks.append((w, str(w)))
+    y_ticks.append((y_max, f"{y_max:.2f}"))
+
+    # Light gridlines first so axes / ticks / data overlay them cleanly.
+    for lap in x_tick_laps:
+        x = x_coord(lap)
+        parts.append(f'<line x1="{x:.1f}" y1="{pad_t}" '
+                     f'x2="{x:.1f}" y2="{pad_t + plot_h}" '
+                     f'stroke="#eeeeee" stroke-width="1"/>')
+    for value, _ in y_ticks:
+        y = y_coord(value)
+        parts.append(f'<line x1="{pad_l}" y1="{y:.1f}" '
+                     f'x2="{pad_l + plot_w}" y2="{y:.1f}" '
+                     f'stroke="#dddddd" stroke-width="1"/>')
+
+    for lap in x_tick_laps:
         x = x_coord(lap)
         parts.append(f'<line x1="{x:.1f}" y1="{pad_t + plot_h}" '
                      f'x2="{x:.1f}" y2="{pad_t + plot_h + 5}" stroke="black"/>')
@@ -819,15 +850,13 @@ def write_chart(path, sequences):
                  f'font-family="sans-serif" font-size="13" '
                  f'text-anchor="middle">Lap</text>')
 
-    n_ticks = 6
-    for i in range(n_ticks + 1):
-        t = y_lo + i * (y_hi - y_lo) / n_ticks
-        y = y_coord(t)
+    for value, label in y_ticks:
+        y = y_coord(value)
         parts.append(f'<line x1="{pad_l - 5}" y1="{y:.1f}" '
                      f'x2="{pad_l}" y2="{y:.1f}" stroke="black"/>')
         parts.append(f'<text x="{pad_l - 8}" y="{y + 4:.1f}" '
                      f'font-family="sans-serif" font-size="11" '
-                     f'text-anchor="end">{t:.2f}</text>')
+                     f'text-anchor="end">{label}</text>')
     parts.append(f'<text x="20" y="{pad_t + plot_h / 2}" '
                  f'font-family="sans-serif" font-size="13" '
                  f'text-anchor="middle" '
