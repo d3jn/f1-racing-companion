@@ -13,9 +13,10 @@ traffic laps, lucky-tow laps, etc.) before running. No outlier filtering is
 done here — every row in the file is treated as a representative racing lap.
 
 Known limitations:
-  - Fuel effect on pace (~0.03 s/kg) is silently baked into wear-indexed lap
-    times. For race-strategy comparison this is acceptable; the fuel curve
-    roughly cancels across plans of similar total length.
+  - Fuel pace effect is applied as a strict linear 2% per 100 kg burned
+    (see FUEL_PACE_FACTOR) on top of the wear-indexed base pace, which is
+    treated by convention as the pace at zero fuel burned. Within a race,
+    pace improves linearly with cumulative fuel burned.
   - Backward and forward wear extrapolation are linear in sequence position.
     Real tires often degrade non-linearly near the cliff; feed the tool real
     long-stint data to keep extrapolation short.
@@ -36,6 +37,9 @@ MAX_FUTURE_PITS = 2           # live mode: search up to this many additional pit
                               # beyond what's already in race history
 PIT_WINDOW_TOLERANCE = 1.0    # seconds; pit window = range of laps that keep
                               # total race time within this of the optimum
+FUEL_PACE_FACTOR = 0.0002     # 1 kg of fuel burned → 0.02% pace improvement
+                              # (= 2% per 100 kg). Multiplied by cumulative
+                              # race-fuel-burned, subtracted from lap pace.
 
 COMPOUND_FLAGS = {"soft": "SOF", "medium": "MED", "hard": "HAR"}
 COMPOUND_LABEL = {"SOF": "Soft", "MED": "Medium", "HAR": "Hard"}
@@ -531,22 +535,44 @@ def build_sequence(rows):
 
     cum_time = [0.0]
     cum_fuel = [0.0]
+    # cum_lap_x_fuel[k] = Σ base_lap_time[i] × cum_fuel[i] for i in 0..k-1.
+    # Built per-lap with the *pre-update* cum_fuel so each entry pairs the
+    # lap's base time with the fuel state at the start of that lap. Lets
+    # the fuel-pace correction stay O(1) inside stint_time.
+    cum_lap_x_fuel = [0.0]
     for entry in sequence:
         cum_time.append(cum_time[-1] + entry["lap_time"])
+        cum_lap_x_fuel.append(cum_lap_x_fuel[-1]
+                              + entry["lap_time"] * cum_fuel[-1])
         cum_fuel.append(cum_fuel[-1] + entry["fuel_delta"])
     return {
         "laps": sequence,
         "cum_time": cum_time,
         "cum_fuel": cum_fuel,
+        "cum_lap_x_fuel": cum_lap_x_fuel,
         "max_laps": len(sequence),
     }
 
 
-def stint_time(seq, length, start_idx=0):
+def stint_time(seq, length, start_idx=0, fuel_burned=0.0):
     """Time for a stint of `length` laps starting from sequence position
-    `start_idx`. start_idx > 0 represents a used tire being re-fitted at
-    some accumulated wear; start_idx = 0 is a fresh tire."""
-    return seq["cum_time"][start_idx + length] - seq["cum_time"][start_idx]
+    `start_idx`, with the race-fuel pace correction.
+
+    `fuel_burned` is the cumulative race fuel burned at the start of
+    this stint. Each lap's pace is multiplied by
+    (1 − FUEL_PACE_FACTOR × race_fuel_at_start_of_lap).
+
+    start_idx > 0 represents a used tire being re-fitted at some
+    accumulated wear; start_idx = 0 is a fresh tire.
+    """
+    if length == 0:
+        return 0.0
+    s = start_idx
+    e = start_idx + length
+    s_l = seq["cum_time"][e] - seq["cum_time"][s]
+    s_lf = seq["cum_lap_x_fuel"][e] - seq["cum_lap_x_fuel"][s]
+    return (s_l * (1.0 - FUEL_PACE_FACTOR * (fuel_burned - seq["cum_fuel"][s]))
+            - FUEL_PACE_FACTOR * s_lf)
 
 
 def stint_fuel(seq, length, start_idx=0):
@@ -591,12 +617,16 @@ def search_one_stop(sequences, total_laps, pit_loss):
                 rest = total_laps - k
                 if rest < 1 or rest > max_b:
                     continue
-                total = stint_time(seq_a, k) + stint_time(seq_b, rest) + pit_loss
+                fuel_a = stint_fuel(seq_a, k)
+                fuel_b = stint_fuel(seq_b, rest)
+                total = (stint_time(seq_a, k, fuel_burned=0.0)
+                         + stint_time(seq_b, rest, fuel_burned=fuel_a)
+                         + pit_loss)
                 if best is None or total < best["total"]:
                     best = {
                         "stints": [(a, k), (b, rest)],
                         "total": total,
-                        "fuel": stint_fuel(seq_a, k) + stint_fuel(seq_b, rest),
+                        "fuel": fuel_a + fuel_b,
                     }
     return best
 
@@ -622,17 +652,18 @@ def search_two_stop(sequences, total_laps, pit_loss):
                         k3 = total_laps - k1 - k2
                         if k3 < 1 or k3 > max_c:
                             continue
-                        total = (stint_time(seq_a, k1)
-                                 + stint_time(seq_b, k2)
-                                 + stint_time(seq_c, k3)
+                        fuel_a = stint_fuel(seq_a, k1)
+                        fuel_b = stint_fuel(seq_b, k2)
+                        fuel_c = stint_fuel(seq_c, k3)
+                        total = (stint_time(seq_a, k1, fuel_burned=0.0)
+                                 + stint_time(seq_b, k2, fuel_burned=fuel_a)
+                                 + stint_time(seq_c, k3, fuel_burned=fuel_a + fuel_b)
                                  + 2 * pit_loss)
                         if best is None or total < best["total"]:
                             best = {
                                 "stints": [(a, k1), (b, k2), (c, k3)],
                                 "total": total,
-                                "fuel": (stint_fuel(seq_a, k1)
-                                         + stint_fuel(seq_b, k2)
-                                         + stint_fuel(seq_c, k3)),
+                                "fuel": fuel_a + fuel_b + fuel_c,
                             }
     return best
 
@@ -646,7 +677,8 @@ def _historical_summary(state, sequences, pit_loss):
     for cs in state["completed_stints"]:
         seq = sequences[cs["compound"]]
         start_idx = wear_to_position(seq, cs["start_wear"])
-        total_time += stint_time(seq, cs["length"], start_idx)
+        total_time += stint_time(seq, cs["length"], start_idx,
+                                 fuel_burned=total_fuel)
         total_fuel += stint_fuel(seq, cs["length"], start_idx)
         stints.append({
             "compound": cs["compound"],
@@ -704,7 +736,8 @@ def search_live(state, total_laps, pit_loss, sequences, forced_next_pit_lap=None
         # Option A: keep current set on for the rest of the race.
         # Skip when the user forced a first pit (they're asking *given* a pit).
         if not is_forced_first and 1 <= remaining <= max_remaining:
-            stint_t = stint_time(seq, remaining, start_idx)
+            stint_t = stint_time(seq, remaining, start_idx,
+                                 fuel_burned=accum_fuel)
             stint_f = stint_fuel(seq, remaining, start_idx)
             full = (historical_stints + future_stints
                     + [_stint_entry(current_set, remaining,
@@ -734,7 +767,8 @@ def search_live(state, total_laps, pit_loss, sequences, forced_next_pit_lap=None
             pit_lap = current_lap + stint_len
             if pit_lap >= total_laps:
                 break
-            stint_t = stint_time(seq, stint_len, start_idx)
+            stint_t = stint_time(seq, stint_len, start_idx,
+                                 fuel_burned=accum_fuel)
             stint_f = stint_fuel(seq, stint_len, start_idx)
             end_wear = compute_end_wear(seq, start_idx, stint_len)
 
@@ -822,6 +856,26 @@ def pit_windows(plan_stints, optimal_total, sequences,
     if len(norm) < 2:
         return {}
 
+    original_lengths = [s["length"] for s in norm]
+
+    def total_with_lengths(lengths):
+        """Sum of fuel-corrected stint times given a per-stint length
+        list. Walks stints in race order so each one sees the correct
+        cumulative race fuel at its start. Pit-loss is not included
+        here — it's a constant across all sweeps and recovered once."""
+        total = 0.0
+        fuel_burned = 0.0
+        for i, L in enumerate(lengths):
+            seq = norm[i]["sequence"]
+            si = norm[i]["start_idx"]
+            total += stint_time(seq, L, si, fuel_burned=fuel_burned)
+            fuel_burned += stint_fuel(seq, L, si)
+        return total
+
+    # Pit losses are constant for the sweep (we never add/remove a pit).
+    # Back them out once so we can rebuild alt totals cleanly.
+    pit_loss_total = optimal_total - total_with_lengths(original_lengths)
+
     windows = {}
     for p in range(len(norm) - 1):
         if norm[p]["phase"] == "done":
@@ -832,10 +886,6 @@ def pit_windows(plan_stints, optimal_total, sequences,
         max_a = s_a["sequence"]["max_laps"] - s_a["start_idx"]
         max_b = s_b["sequence"]["max_laps"] - s_b["start_idx"]
 
-        t_a = stint_time(s_a["sequence"], original_a, s_a["start_idx"])
-        t_b = stint_time(s_b["sequence"], original_b, s_b["start_idx"])
-        other_time = optimal_total - t_a - t_b  # all other stints + pit losses
-
         start_of_stint_p = sum(norm[i]["length"] for i in range(p))
 
         earliest = None
@@ -844,9 +894,10 @@ def pit_windows(plan_stints, optimal_total, sequences,
             alt_b = combined - alt_a
             if alt_a > max_a or alt_b > max_b:
                 continue
-            alt_total = (other_time
-                         + stint_time(s_a["sequence"], alt_a, s_a["start_idx"])
-                         + stint_time(s_b["sequence"], alt_b, s_b["start_idx"]))
+            alt_lengths = list(original_lengths)
+            alt_lengths[p] = alt_a
+            alt_lengths[p + 1] = alt_b
+            alt_total = total_with_lengths(alt_lengths) + pit_loss_total
             if alt_total <= optimal_total + tolerance:
                 pit_lap = start_of_stint_p + alt_a
                 if earliest is None or pit_lap < earliest:
