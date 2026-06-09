@@ -17,8 +17,8 @@ Known limitations:
     fuel burn, so each stint gets a single constant correction (not a per-lap
     one) for the offset between the actual fuel in the tank at the start of
     the stint and the fuel the data was recorded at (its reference fuel, taken
-    from the lowest-tire-wear lap). 1 kg lighter than the reference → 0.045%
-    quicker, linear (= 4.5% per 100 kg, see FUEL_PACE_FACTOR). Race start fuel
+    from the lowest-tire-wear lap). 1 kg lighter than the reference → 0.025%
+    quicker, linear (= 2.5% per 100 kg, see FUEL_PACE_FACTOR). Race start fuel
     is assumed to equal the starting compound's reference fuel, so the first
     stint is unmodified.
   - Backward and forward wear extrapolation are linear in sequence position.
@@ -41,9 +41,9 @@ MAX_FUTURE_PITS = 2           # live mode: search up to this many additional pit
                               # beyond what's already in race history
 PIT_WINDOW_TOLERANCE = 1.0    # seconds; pit window = range of laps that keep
                               # total race time within this of the optimum
-FUEL_PACE_FACTOR = 0.00045    # 1 kg of fuel difference vs the stint data's
-                              # reference fuel → 0.045% lap-time change
-                              # (= 4.5% per 100 kg). The within-stint burn is
+FUEL_PACE_FACTOR = 0.00025    # 1 kg of fuel difference vs the stint data's
+                              # reference fuel → 0.025% lap-time change
+                              # (= 2.5% per 100 kg). The within-stint burn is
                               # already baked into the recorded lap times, so
                               # this only corrects for the offset between the
                               # tank at stint start and the data's reference.
